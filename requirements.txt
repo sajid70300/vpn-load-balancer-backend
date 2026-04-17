@@ -1,0 +1,21 @@
+# FastAPI
+fastapi
+uvicorn[standard]
+
+# Database
+sqlalchemy
+asyncpg
+psycopg2-binary
+
+# Celery
+celery
+redis
+
+# Cache
+aioredis
+
+# Utils
+python-dotenv
+pydantic-settings
+psutil
+requests

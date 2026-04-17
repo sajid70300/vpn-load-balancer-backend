@@ -1,0 +1,8 @@
+*.bak
+*.dat
+*.dir
+commands.txt
+__pycache__
+.env
+*.env
+myenv
