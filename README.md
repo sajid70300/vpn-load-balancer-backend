@@ -324,3 +324,8 @@ For issues or feature requests, please contact the development team.
 ---
 
 **Built with ❤️ using FastAPI, PostgreSQL, and Redis**
+
+
+## Related Projects
+
+- [VPN Load Balancer Frontend](https://github.com/sajid70300/vpn-load-balancer-frontend.git)
