@@ -386,25 +386,61 @@ async def all_users(
     app_name: Optional[str] = None,
     config_tag: Optional[str] = None,
     protocol: Optional[str] = Query(None, pattern="^(openvpn|shadowsocks)$"),
+    search: Optional[str] = Query(None, description="Search by user ID, device IP, server name, or server IP"),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=500),
     db: AsyncSession = Depends(get_db)
 ):
-    """Get all active user sessions with optional filtering."""
-    query = select(VPNUserSession).options(selectinload(VPNUserSession.server))
+    """Get paginated active user sessions with optional filtering and search."""
 
+    # Build shared filter conditions -- reused for COUNT and data query
     conditions = []
+    needs_server_join = False
+
     if server_type:
         conditions.append(VPNServer.server_type == server_type)
+        needs_server_join = True
     if app_name:
         conditions.append(VPNServer.app_name == app_name)
+        needs_server_join = True
     if config_tag:
         conditions.append(VPNUserSession.config_tag == config_tag)
     if protocol:
         conditions.append(VPNUserSession.protocol == protocol)
+    if search:
+        pat = f"%{search}%"
+        # user_id and device_ip are on VPNUserSession (no join needed for them alone)
+        # server name and server ip_address are on VPNServer (join required)
+        conditions.append(
+            VPNUserSession.user_id.ilike(pat)
+            | VPNUserSession.device_ip.ilike(pat)
+            | VPNServer.name.ilike(pat)
+            | VPNServer.ip_address.ilike(pat)
+        )
+        needs_server_join = True
 
+    # Fast COUNT(*) -- cheap, no row fetching
+    count_query = select(func.count()).select_from(VPNUserSession)
+    if needs_server_join:
+        count_query = count_query.join(VPNServer)
     if conditions:
-        query = query.join(VPNServer).where(and_(*conditions))
+        count_query = count_query.where(and_(*conditions))
+    total = (await db.execute(count_query)).scalar() or 0
 
-    result = await db.execute(query)
+    # Paginated data query -- only fetches `limit` rows
+    data_query = (
+        select(VPNUserSession)
+        .options(selectinload(VPNUserSession.server))
+        .order_by(VPNUserSession.connected_time.desc())
+        .offset(skip)
+        .limit(limit)
+    )
+    if needs_server_join:
+        data_query = data_query.join(VPNServer)
+    if conditions:
+        data_query = data_query.where(and_(*conditions))
+
+    result = await db.execute(data_query)
     sessions = result.scalars().all()
 
     users = [
@@ -423,7 +459,7 @@ async def all_users(
         for s in sessions
     ]
 
-    return AllUsersResponse(users=users)
+    return AllUsersResponse(users=users, total=total, skip=skip, limit=limit)
 
 
 @router.get("/servers_config/", tags=["Public API"])

@@ -352,6 +352,9 @@ class UserSession(BaseModel):
 
 class AllUsersResponse(BaseModel):
     users: list[UserSession]
+    total: int = 0
+    skip: int = 0
+    limit: int = 50
 
 
 class ServerConfig(BaseModel):
