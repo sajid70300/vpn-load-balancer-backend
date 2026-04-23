@@ -188,8 +188,11 @@ class FinalizeServerPayload(BaseModel):
     """
     Sent from AppConfigure when configuring a PhysicalMachine for this app.
     Creates (or updates) a single VPNServer row for this machine+app.
+    server_type can be overridden per-app (free or premium),
+    allowing the same physical machine to serve both tiers in the same app.
     """
     machine_id:        int
+    server_type:       str = "free"  # overrides machine default; free | premium
     is_priority_group: bool = False
 
     # OpenVPN config
@@ -244,6 +247,9 @@ async def list_app_servers(
             "ram_usage":           round(server.ram_usage, 2),
             "ping_latency_ms":     round(server.ping_latency_ms, 2),
             "load_score":          round(server.load_score, 2),
+            # Protocol availability flags
+            "has_openvpn":         server.management_port is not None,
+            "has_shadowsocks":     server.ss_port is not None and server.ss_password is not None,
             # OpenVPN config (for edit pre-fill)
             "management_port":     server.management_port,
             "ovpn_base64":         server.ovpn_base64,
@@ -281,12 +287,14 @@ async def finalize_server_for_app(
     if not machine:
         raise HTTPException(status_code=404, detail="Physical machine not found")
 
-    # Check if already finalized for this app (update path)
+    # Check if already finalized for this app+server_type combination (update path)
+    # Same machine can be finalized twice in the same app as free AND premium
     existing_result = await db.execute(
         select(VPNServer).where(
             and_(
                 VPNServer.physical_machine_id == payload.machine_id,
                 VPNServer.app_name == app_id,
+                VPNServer.server_type == payload.server_type,
             )
         )
     )
@@ -300,7 +308,7 @@ async def finalize_server_for_app(
         name                = machine.name,
         ip_address          = machine.ip_address,
         app_name            = app_id,
-        server_type         = machine.server_type,
+        server_type         = payload.server_type,
         server_city         = machine.server_city,
         server_country      = machine.server_country,
         flag_image_url      = machine.flag_image_url,

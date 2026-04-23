@@ -19,7 +19,7 @@ from pydantic import BaseModel
 from typing import Optional
 
 from app.database import get_db
-from app.models import PhysicalMachine, VPNServer
+from app.models import PhysicalMachine, VPNServer, VPNUserSession
 from app.auth import verify_api_key
 from app.audit import audit_log
 
@@ -52,7 +52,7 @@ class MachineUpdate(BaseModel):
     is_active:          Optional[bool] = None
 
 
-def _machine_out(m: PhysicalMachine, finalized_apps: list[str] = None) -> dict:
+def _machine_out(m: PhysicalMachine, finalized_apps: list[str] = None, connected_users: int = 0) -> dict:
     return {
         "id":                  m.id,
         "name":                m.name,
@@ -67,6 +67,7 @@ def _machine_out(m: PhysicalMachine, finalized_apps: list[str] = None) -> dict:
         "created_at":          m.created_at,
         "updated_at":          m.updated_at,
         "finalized_apps":      finalized_apps or [],  # which apps this machine is finalized for
+        "connected_users":     connected_users,       # distinct users across all rows for this machine
     }
 
 
@@ -126,7 +127,28 @@ async def list_machines(
             if app_name and app_name not in finalized[pm_id]:
                 finalized[pm_id].append(app_name)
 
-    out = [_machine_out(m, finalized[m.id]) for m in machines]
+    # Count distinct (user_id, device_ip) pairs per physical machine
+    # Avoids double-counting when same user appears in multiple VPNServer rows
+    # (free + premium, or same machine finalized for multiple apps)
+    connected: dict[int, int] = {m.id: 0 for m in machines}
+    if machine_ids:
+        sessions_result = await db.execute(
+            select(
+                VPNServer.physical_machine_id,
+                func.count(
+                    func.distinct(
+                        VPNUserSession.user_id + '|' + VPNUserSession.device_ip
+                    )
+                ).label('user_count')
+            )
+            .join(VPNUserSession, VPNUserSession.server_id == VPNServer.id)
+            .where(VPNServer.physical_machine_id.in_(machine_ids))
+            .group_by(VPNServer.physical_machine_id)
+        )
+        for pm_id, count in sessions_result.all():
+            connected[pm_id] = count
+
+    out = [_machine_out(m, finalized[m.id], connected[m.id]) for m in machines]
     total = len(out)
     return {"total": total, "skip": skip, "limit": limit, "machines": out[skip: skip + limit]}
 

@@ -94,6 +94,9 @@ def _server_out(server: VPNServer, current_users: int) -> dict:
         "ovpn_base64":        (server.ovpn_base64[:100] + "...") if server.ovpn_base64 else None,
         "config_tag":         server.config_tag,
         "cn_match":           server.cn_match,
+        # Protocol availability flags
+        "has_openvpn":        server.management_port is not None,
+        "has_shadowsocks":    server.ss_port is not None and server.ss_password is not None,
         # Shadowsocks
         "ss_port":            server.ss_port,
         "ss_password":        server.ss_password,

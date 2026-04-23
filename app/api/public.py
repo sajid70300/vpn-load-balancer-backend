@@ -388,7 +388,7 @@ async def all_users(
     protocol: Optional[str] = Query(None, pattern="^(openvpn|shadowsocks)$"),
     search: Optional[str] = Query(None, description="Search by user ID, device IP, server name, or server IP"),
     skip: int = Query(0, ge=0),
-    limit: int = Query(50, ge=1, le=500),
+    limit: int = Query(50, ge=1, le=1000),
     db: AsyncSession = Depends(get_db)
 ):
     """Get paginated active user sessions with optional filtering and search."""
@@ -451,6 +451,7 @@ async def all_users(
             bytes_sent=s.bytes_sent,
             connected_time=s.connected_time,
             server_name=s.server.name,
+            server_ip=s.server.ip_address,
             server_type=s.server.server_type,
             app_name=s.server.app_name,
             config_tag=s.config_tag,

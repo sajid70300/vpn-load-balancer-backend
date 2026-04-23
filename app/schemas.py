@@ -344,6 +344,7 @@ class UserSession(BaseModel):
     bytes_sent: int
     connected_time: datetime
     server_name: str
+    server_ip: Optional[str] = None
     server_type: str
     app_name: Optional[str]
     config_tag: Optional[str]
