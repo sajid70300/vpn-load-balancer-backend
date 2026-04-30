@@ -22,9 +22,11 @@ class Settings(BaseSettings):
     CELERY_BROKER_URL: str
     CELERY_RESULT_BACKEND: str
     
-    # GeoIP (optional - not used yet but defined in .env)
-    GEOIP_DB_PATH: Optional[str] = "/path/to/GeoLite2-City.mmdb"
-    GEOIP_ASN_PATH: Optional[str] = "/path/to/GeoLite2-ASN.mmdb"
+    # GeoIP - paths to MaxMind GeoLite2 database files
+    GEOIP_COUNTRY_PATH: Optional[str] = "/opt/geoip/GeoLite2-Country.mmdb"
+    GEOIP_ASN_PATH: Optional[str] = "/opt/geoip/GeoLite2-ASN.mmdb"
+    MAXMIND_ACCOUNT_ID: Optional[str] = None   # your MaxMind account ID
+    MAXMIND_LICENSE_KEY: Optional[str] = None   # your MaxMind license key
     
     # App Config
     PROJECT_NAME: str = "VPN Load Balancer API"
