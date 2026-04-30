@@ -42,10 +42,14 @@ celery_app.conf.beat_schedule = {
         'task': 'cleanup_shadowsocks',
         'schedule': 300.0,  # every 5 minutes
     },
+    'update-geoip-databases-weekly': {
+        'task': 'update_geoip',
+        'schedule': crontab(hour=3, minute=0, day_of_week=2),  # every Tuesday at 3am UTC
+    },
 }
 
 # Register tasks
-from app.tasks import monitor_vpn_status, monitor_all_server_metrics, cleanup_stale_shadowsocks_sessions
+from app.tasks import monitor_vpn_status, monitor_all_server_metrics, cleanup_stale_shadowsocks_sessions, update_geoip_databases
 
 @celery_app.task(name='monitor_vpn')
 def monitor_vpn():
@@ -58,3 +62,7 @@ def monitor_metrics():
 @celery_app.task(name='cleanup_shadowsocks')
 def cleanup_shadowsocks():
     cleanup_stale_shadowsocks_sessions()
+
+@celery_app.task(name='update_geoip')
+def update_geoip():
+    update_geoip_databases()
