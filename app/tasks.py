@@ -1113,3 +1113,107 @@ def cleanup_stale_shadowsocks_sessions():
         print(f"❌ Error cleaning up stale Shadowsocks sessions: {e}")
     finally:
         db.close()
+
+
+def update_geoip_databases():
+    """
+    Downloads fresh GeoLite2-Country and GeoLite2-ASN .mmdb files from MaxMind
+    and replaces the existing ones in place.
+
+    MaxMind releases database updates every Tuesday.
+    This task should be scheduled to run weekly (e.g. every Tuesday at 3am UTC).
+
+    Requires in .env:
+        MAXMIND_ACCOUNT_ID   - your MaxMind account ID
+        MAXMIND_LICENSE_KEY  - your MaxMind license key
+        GEOIP_COUNTRY_PATH   - full path to GeoLite2-Country.mmdb
+        GEOIP_ASN_PATH       - full path to GeoLite2-ASN.mmdb
+    """
+    import requests
+    import tarfile
+    import shutil
+    import tempfile
+    import os
+    from app.config import settings
+
+    EDITIONS = [
+        {
+            "edition_id": "GeoLite2-Country",
+            "dest_path": settings.GEOIP_COUNTRY_PATH,
+            "mmdb_filename": "GeoLite2-Country.mmdb",
+        },
+        {
+            "edition_id": "GeoLite2-ASN",
+            "dest_path": settings.GEOIP_ASN_PATH,
+            "mmdb_filename": "GeoLite2-ASN.mmdb",
+        },
+    ]
+
+    account_id  = getattr(settings, "MAXMIND_ACCOUNT_ID", None)
+    license_key = getattr(settings, "MAXMIND_LICENSE_KEY", None)
+
+    if not account_id or not license_key:
+        print("❌ GeoIP update skipped: MAXMIND_ACCOUNT_ID or MAXMIND_LICENSE_KEY not set in .env")
+        return
+
+    print("🌍 Starting GeoIP database update...")
+
+    for edition in EDITIONS:
+        edition_id   = edition["edition_id"]
+        dest_path    = edition["dest_path"]
+        mmdb_filename = edition["mmdb_filename"]
+
+        url = (
+            f"https://download.maxmind.com/geoip/databases/{edition_id}/download"
+            f"?suffix=tar.gz"
+        )
+
+        try:
+            print(f"⬇️  Downloading {edition_id}...")
+            response = requests.get(
+                url,
+                auth=(str(account_id), license_key),
+                timeout=60,
+                stream=True,
+            )
+
+            if response.status_code != 200:
+                print(f"❌ Failed to download {edition_id}: HTTP {response.status_code}")
+                continue
+
+            # Write to a temp file
+            with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp_file:
+                tmp_path = tmp_file.name
+                for chunk in response.iter_content(chunk_size=8192):
+                    tmp_file.write(chunk)
+
+            # Extract the .mmdb from the tar.gz
+            with tempfile.TemporaryDirectory() as extract_dir:
+                with tarfile.open(tmp_path, "r:gz") as tar:
+                    tar.extractall(extract_dir)
+
+                # Find the .mmdb file inside extracted folder
+                mmdb_found = None
+                for root, dirs, files in os.walk(extract_dir):
+                    for f in files:
+                        if f == mmdb_filename:
+                            mmdb_found = os.path.join(root, f)
+                            break
+
+                if not mmdb_found:
+                    print(f"❌ Could not find {mmdb_filename} in downloaded archive")
+                    continue
+
+                # Ensure destination directory exists
+                os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+
+                # Replace the existing .mmdb file
+                shutil.move(mmdb_found, dest_path)
+                print(f"✅ {edition_id} updated → {dest_path}")
+
+            os.unlink(tmp_path)
+
+        except Exception as e:
+            print(f"❌ Error updating {edition_id}: {e}")
+
+    print("🌍 GeoIP database update complete.")
