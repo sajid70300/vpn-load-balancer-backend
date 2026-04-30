@@ -3,13 +3,15 @@ Public API endpoints with Decision Engine Integration
 Supports both OpenVPN and Shadowsocks with intelligent protocol selection.
 """
 
-from fastapi import APIRouter, Depends, Query, HTTPException
+from fastapi import APIRouter, Depends, Query, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_
 from sqlalchemy.orm import selectinload
 from typing import Optional
 from datetime import datetime
 import random
+import geoip2.database
+import geoip2.errors
 
 from app.database import get_db
 from app.models import VPNServer, VPNUserSession
@@ -21,8 +23,54 @@ from app.schemas import (
 from app.auth import verify_api_key
 from app.cache import get_cache, set_cache, delete_cache
 from app.decision_engine import DecisionEngine
+from app.config import settings
 
 router = APIRouter()
+
+
+@router.get("/v1/my-info/", tags=["Public API"])
+async def my_info(request: Request):
+    """
+    Returns the caller's IP address, country code, and ASN.
+    Uses local MaxMind GeoLite2 databases — no external API calls, no rate limits.
+
+    Mobile apps call this FIRST, then pass country + asn to /v2/best_server/.
+
+    Example response:
+        { "ip": "1.2.3.4", "country": "PK", "asn": "AS17557", "isp": "Pakistan Telecom" }
+    """
+    # Get real client IP (works behind proxies/nginx too)
+    forwarded_for = request.headers.get("X-Forwarded-For")
+    if forwarded_for:
+        ip = forwarded_for.split(",")[0].strip()
+    else:
+        ip = request.client.host
+
+    result = {
+        "ip": ip,
+        "country": None,
+        "asn": None,
+        "isp": None,
+    }
+
+    # Country lookup
+    try:
+        with geoip2.database.Reader(settings.GEOIP_COUNTRY_PATH) as reader:
+            country_response = reader.country(ip)
+            result["country"] = country_response.country.iso_code  # e.g. "PK"
+    except (geoip2.errors.AddressNotFoundError, Exception):
+        pass  # country stays None — caller should handle gracefully
+
+    # ASN lookup
+    try:
+        with geoip2.database.Reader(settings.GEOIP_ASN_PATH) as reader:
+            asn_response = reader.asn(ip)
+            result["asn"] = f"AS{asn_response.autonomous_system_number}"  # e.g. "AS17557"
+            result["isp"] = asn_response.autonomous_system_organization    # e.g. "PTCL"
+    except (geoip2.errors.AddressNotFoundError, Exception):
+        pass  # asn stays None — caller should handle gracefully
+
+    return result
 
 
 @router.get("/", tags=["Root"])
