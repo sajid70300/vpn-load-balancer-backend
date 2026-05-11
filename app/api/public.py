@@ -513,7 +513,7 @@ async def all_users(
 
 @router.get("/servers_config/", tags=["Public API"])
 async def servers_config(
-    app_name: Optional[str] = None,
+    app_name: str = Query(..., description="App name (required)"),
     server_type: Optional[str] = Query(None, pattern="^(free|premium)$"),
     country: Optional[str] = Query(None, description="User's country code"),
     asn: Optional[str] = Query(None, description="User's ISP ASN"),
@@ -523,6 +523,7 @@ async def servers_config(
 ):
     """
     Get server configurations for mobile apps.
+    app_name is required — only servers belonging to that app are returned.
 
     When country/asn/network_type are provided (decision mode):
       Returns ServerConfigDecision list — each server scored for primary/fallback protocol.
@@ -563,6 +564,7 @@ async def servers_config(
             decision = await engine.get_protocol_decision_for_server(
                 ip_address   = srv.ip_address,
                 server_type  = srv.server_type,
+                app_name     = app_name,
                 user_country = country,
                 user_asn     = asn,
                 network_type = network_type,

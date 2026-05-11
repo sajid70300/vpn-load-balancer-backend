@@ -194,6 +194,7 @@ class DecisionEngine:
         self,
         ip_address:   str,
         server_type:  Optional[str],
+        app_name:     Optional[str] = None,
         user_country: Optional[str] = None,
         user_asn:     Optional[str] = None,
         network_type: Optional[str] = None,
@@ -213,6 +214,8 @@ class DecisionEngine:
         ]
         if server_type:
             conditions.append(VPNServer.server_type == server_type)
+        if app_name:
+            conditions.append(VPNServer.app_name == app_name)
 
         query = (
             select(VPNServer, func.count(VPNUserSession.id).label('session_count'))
