@@ -383,12 +383,17 @@ def fetch_server_metrics(server_id: int):
     """
     Fetch CPU/RAM/ping metrics from the monitoring API for a single server.
     Updates the VPNServer row directly.
+    If the API fails (timeout, error, non-200), a cooldown key is set in Redis
+    so the URL is skipped for METRICS_API_RETRY_MINUTES minutes.
     """
     db = get_db_session()
     try:
         server = db.query(VPNServer).filter(VPNServer.id == server_id).first()
         if not server or not server.monitoring_api_url:
             return
+
+        cooldown_key  = f"metrics_retry:{server.monitoring_api_url}"
+        retry_seconds = settings.METRICS_API_RETRY_MINUTES * 60
 
         try:
             response = requests.get(f"{server.monitoring_api_url}/metrics", timeout=5)
@@ -399,9 +404,9 @@ def fetch_server_metrics(server_id: int):
                 ram_usage    = data.get('ram_percent', 0.0)
                 ping_ms      = data.get('ping_ms', 0.0)
 
-                server.cpu_usage       = cpu_usage
-                server.ram_usage       = ram_usage
-                server.ping_latency_ms = ping_ms
+                server.cpu_usage         = cpu_usage
+                server.ram_usage         = ram_usage
+                server.ping_latency_ms   = ping_ms
                 server.last_health_check = current_time
 
                 if cpu_usage > server.peak_cpu:
@@ -426,12 +431,18 @@ def fetch_server_metrics(server_id: int):
                     )
 
                 db.commit()
+                # API responded successfully — clear any existing cooldown
+                redis_client.delete(cooldown_key)
                 print(f"✅ {server.name}: CPU={cpu_usage:.1f}% RAM={ram_usage:.1f}% Ping={ping_ms:.1f}ms")
             else:
-                print(f"⚠️ Failed to fetch metrics for {server.name}: HTTP {response.status_code}")
+                # Non-200 response — set cooldown
+                redis_client.set(cooldown_key, "1", ex=retry_seconds)
+                print(f"⚠️ Failed to fetch metrics for {server.name}: HTTP {response.status_code} — cooldown set for {settings.METRICS_API_RETRY_MINUTES}m")
 
         except requests.exceptions.RequestException as e:
-            print(f"❌ Error fetching metrics for {server.name}: {e}")
+            # Timeout or connection error — set cooldown
+            redis_client.set(cooldown_key, "1", ex=retry_seconds)
+            print(f"❌ Error fetching metrics for {server.name}: {e} — cooldown set for {settings.METRICS_API_RETRY_MINUTES}m")
 
     finally:
         db.close()
@@ -523,14 +534,21 @@ def monitor_all_server_metrics():
 
             # Deduplicate by monitoring_api_url so each physical machine is fetched once
             seen_urls: set = set()
+            skipped_urls: set = set()
             for server in servers:
                 url = server.monitoring_api_url
-                if url in seen_urls:
+                if url in seen_urls or url in skipped_urls:
+                    continue
+                cooldown_key = f"metrics_retry:{url}"
+                if redis_client.exists(cooldown_key):
+                    ttl = redis_client.ttl(cooldown_key)
+                    print(f"⏳ Skipping metrics for {url} — cooldown active ({ttl}s remaining)")
+                    skipped_urls.add(url)
                     continue
                 seen_urls.add(url)
                 fetch_server_metrics(server.id)
 
-            print(f"📊 Fetched metrics for {len(seen_urls)} unique monitoring API(s)")
+            print(f"📊 Fetched metrics for {len(seen_urls)} unique monitoring API(s), skipped {len(skipped_urls)}")
         finally:
             db.close()
     finally:

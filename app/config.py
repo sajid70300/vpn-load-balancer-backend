@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     
     # Monitoring
     INACTIVE_SERVER_RETRY_MINUTES: int = 10  # How long to wait before retrying an inactive server
+    METRICS_API_RETRY_MINUTES: int = 5       # How long to wait before retrying a failed metrics API
 
     # App Config
     PROJECT_NAME: str = "VPN Load Balancer API"
