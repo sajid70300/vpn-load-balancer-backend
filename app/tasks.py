@@ -14,6 +14,7 @@ from sqlalchemy import select, and_, update, delete
 from sqlalchemy.orm import Session
 from app.database import SyncSessionLocal
 from app.models import VPNServer, VPNUserSession, Notification
+from app.config import settings
 import redis
 
 
@@ -194,7 +195,7 @@ def sync_server_sessions(db: Session, server: VPNServer, active_users: dict):
         server.peak_users_time = datetime.utcnow()
 
 
-def process_server_group(server_ids: list):
+def process_server_group(server_ids: list, inactive_retry_seconds: int = 600):
     """
     Process a group of VPNServer rows that share the same physical machine
     (same ip:management_port).
@@ -229,6 +230,9 @@ def process_server_group(server_ids: list):
         response = get_openvpn_status(ip_address, management_port)
 
         if response is None:
+            # Set a cooldown so this group is skipped for the next 10 minutes
+            cooldown_key = f"inactive_retry:{ip_address}:{management_port}"
+            redis_client.set(cooldown_key, "1", ex=inactive_retry_seconds)
             # Mark ALL rows in group as inactive and clear their sessions
             for server in servers:
                 if server.is_active:
@@ -356,6 +360,9 @@ def process_server_group(server_ids: list):
                 }
 
             server.is_active = True
+            # Server recovered — clear any inactive cooldown
+            cooldown_key = f"inactive_retry:{ip_address}:{management_port}"
+            redis_client.delete(cooldown_key)
             sync_server_sessions(db, server, active_users)
             print(f"✅ {server.name} ({server.app_name}/{server.server_type}): "
                   f"{len(active_users)} users (matched: {matched_count}, skipped: {skipped_count})")
@@ -457,8 +464,8 @@ def monitor_vpn_status():
     try:
         db = get_db_session()
         try:
-            vpn_servers = db.query(VPNServer).filter(VPNServer.is_active == True).all()
-            print(f"📊 Monitoring {len(vpn_servers)} server(s)...")
+            vpn_servers = db.query(VPNServer).all()
+            print(f"📊 Monitoring {len(vpn_servers)} server(s) (active + inactive for auto-recovery)...")
 
             # Group rows by ip:management_port — one physical machine may have
             # multiple VPNServer rows (e.g. free + premium, or multiple apps).
@@ -469,9 +476,16 @@ def monitor_vpn_status():
                 key = f"{server.ip_address}:{server.management_port}"
                 groups[key].append(server.id)
 
+            INACTIVE_RETRY_SECONDS = settings.INACTIVE_SERVER_RETRY_MINUTES * 60
+
             for key, server_ids in groups.items():
+                cooldown_key = f"inactive_retry:{key}"
+                if redis_client.exists(cooldown_key):
+                    ttl = redis_client.ttl(cooldown_key)
+                    print(f"⏳ Skipping {key} — inactive cooldown active ({ttl}s remaining)")
+                    continue
                 print(f"🔄 Processing {key} — {len(server_ids)} row(s)")
-                process_server_group(server_ids)
+                process_server_group(server_ids, inactive_retry_seconds=INACTIVE_RETRY_SECONDS)
 
         finally:
             db.close()

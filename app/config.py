@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     MAXMIND_ACCOUNT_ID: Optional[str] = None   # your MaxMind account ID
     MAXMIND_LICENSE_KEY: Optional[str] = None   # your MaxMind license key
     
+    # Monitoring
+    INACTIVE_SERVER_RETRY_MINUTES: int = 10  # How long to wait before retrying an inactive server
+
     # App Config
     PROJECT_NAME: str = "VPN Load Balancer API"
     VERSION: str = "1.0.0"
