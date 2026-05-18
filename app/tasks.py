@@ -359,6 +359,12 @@ def process_server_group(server_ids: list, inactive_retry_seconds: int = 600):
                     'bytes_sent':     bandwidth['bytes_sent'],
                 }
 
+            # Notify if this server was previously inactive (check before flipping the flag)
+            if not server.is_active:
+                create_notification_if_needed(
+                    db, 'server_recovered', server,
+                    f"Server '{server.name}' ({server.ip_address}) is back online and has been marked active."
+                )
             server.is_active = True
             # Server recovered — clear any inactive cooldown
             cooldown_key = f"inactive_retry:{ip_address}:{management_port}"
