@@ -36,7 +36,7 @@ celery_app.conf.beat_schedule = {
     },
     'fetch-metrics-every-10-seconds': {
         'task': 'monitor_metrics',
-        'schedule': 10.0,
+        'schedule': 25.0,
     },
     'cleanup-stale-shadowsocks-every-5-minutes': {
         'task': 'cleanup_shadowsocks',
