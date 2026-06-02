@@ -95,6 +95,72 @@ async def get_protocol_metrics(
     }
 
 
+@router.get("/metrics/protocols/by-country")
+async def get_protocol_metrics_by_country(
+    app_name: Optional[str] = None,
+    min_attempts: int = Query(1, ge=1),
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_api_key)
+):
+    """
+    Get protocol success rates aggregated by country.
+
+    Performs GROUP BY country + protocol directly in PostgreSQL so only
+    ~250 rows are ever returned regardless of how large protocol_metrics grows.
+    Used by the Protocol Health page country table.
+    """
+    conditions = [ProtocolMetrics.country.isnot(None)]
+    if app_name:
+        conditions.append(ProtocolMetrics.app_name == app_name)
+
+    query = (
+        select(
+            ProtocolMetrics.country,
+            ProtocolMetrics.protocol,
+            func.sum(ProtocolMetrics.success_count).label('success_count'),
+            func.sum(ProtocolMetrics.total_attempts).label('total_attempts'),
+        )
+        .where(and_(*conditions))
+        .group_by(ProtocolMetrics.country, ProtocolMetrics.protocol)
+        .having(func.sum(ProtocolMetrics.total_attempts) >= min_attempts)
+        .order_by(ProtocolMetrics.country)
+    )
+
+    result = await db.execute(query)
+    rows = result.all()
+
+    # Pivot into { country -> { openvpn: {...}, shadowsocks: {...} } }
+    country_map = {}
+    for country, protocol, success, total in rows:
+        if country not in country_map:
+            country_map[country] = {
+                'openvpn':     {'success_count': 0, 'total_attempts': 0},
+                'shadowsocks': {'success_count': 0, 'total_attempts': 0},
+            }
+        if protocol in ('openvpn', 'shadowsocks'):
+            country_map[country][protocol]['success_count']  = success
+            country_map[country][protocol]['total_attempts'] = total
+
+    def rate(s, t):
+        return round((s / t) * 100, 1) if t > 0 else None
+
+    country_list = [
+        {
+            'country':              c,
+            'openvpn_success_rate': rate(d['openvpn']['success_count'],     d['openvpn']['total_attempts']),
+            'openvpn_attempts':     d['openvpn']['total_attempts'],
+            'shadowsocks_success_rate': rate(d['shadowsocks']['success_count'], d['shadowsocks']['total_attempts']),
+            'shadowsocks_attempts': d['shadowsocks']['total_attempts'],
+        }
+        for c, d in country_map.items()
+    ]
+
+    return {
+        "total": len(country_list),
+        "countries": country_list,
+    }
+
+
 @router.get("/metrics/summary")
 async def get_metrics_summary(
     app_name: Optional[str] = None,
