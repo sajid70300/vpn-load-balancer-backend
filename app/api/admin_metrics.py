@@ -115,15 +115,15 @@ async def get_protocol_metrics_by_country(
 
     query = (
         select(
-            ProtocolMetrics.country,
+            func.upper(ProtocolMetrics.country).label('country'),
             ProtocolMetrics.protocol,
             func.sum(ProtocolMetrics.success_count).label('success_count'),
             func.sum(ProtocolMetrics.total_attempts).label('total_attempts'),
         )
         .where(and_(*conditions))
-        .group_by(ProtocolMetrics.country, ProtocolMetrics.protocol)
+        .group_by(func.upper(ProtocolMetrics.country), ProtocolMetrics.protocol)
         .having(func.sum(ProtocolMetrics.total_attempts) >= min_attempts)
-        .order_by(ProtocolMetrics.country)
+        .order_by(func.upper(ProtocolMetrics.country))
     )
 
     result = await db.execute(query)

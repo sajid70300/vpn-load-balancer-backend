@@ -883,6 +883,9 @@ class DecisionEngine:
         Fetch or create a ProtocolMetrics row keyed on:
           (server_id, protocol, country, asn, network_type)
         """
+        # Normalize country to uppercase so 'pk' and 'PK' are treated as the same
+        country = country.upper() if country else country
+
         q = select(ProtocolMetrics).where(and_(
             ProtocolMetrics.server_id    == server_id,
             ProtocolMetrics.protocol     == protocol,
