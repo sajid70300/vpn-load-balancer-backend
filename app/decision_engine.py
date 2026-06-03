@@ -150,6 +150,9 @@ class DecisionEngine:
         if gs.disable_new_connections:
             raise ValueError("New connections are currently disabled (maintenance mode)")
 
+        # Normalize country to uppercase so 'pk' and 'PK' are always treated the same
+        user_country = user_country.upper() if user_country else user_country
+
         protocol_mode = gs.protocol_mode
 
         # ── Phase 1: load servers ─────────────────────────────────────────
@@ -207,6 +210,9 @@ class DecisionEngine:
         """
         gs = await self._load_global_settings()
         protocol_mode = gs.protocol_mode
+
+        # Normalize country to uppercase so 'pk' and 'PK' are always treated the same
+        user_country = user_country.upper() if user_country else user_country
 
         conditions = [
             VPNServer.is_active  == True,
