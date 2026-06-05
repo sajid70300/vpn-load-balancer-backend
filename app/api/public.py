@@ -27,6 +27,18 @@ from app.config import settings
 
 router = APIRouter()
 
+# Open GeoIP database readers once at module load time.
+# Opening them per-request wastes 2 file descriptors per /v1/my-info/ call.
+try:
+    _geoip_country_reader = geoip2.database.Reader(settings.GEOIP_COUNTRY_PATH)
+except Exception:
+    _geoip_country_reader = None
+
+try:
+    _geoip_asn_reader = geoip2.database.Reader(settings.GEOIP_ASN_PATH)
+except Exception:
+    _geoip_asn_reader = None
+
 
 @router.get("/v1/my-info/", tags=["Public API"])
 async def my_info(request: Request):
@@ -55,20 +67,20 @@ async def my_info(request: Request):
 
     # Country lookup
     try:
-        with geoip2.database.Reader(settings.GEOIP_COUNTRY_PATH) as reader:
-            country_response = reader.country(ip)
-            result["country"] = country_response.country.iso_code  # e.g. "PK"
+        if _geoip_country_reader:
+            country_response = _geoip_country_reader.country(ip)
+            result["country"] = country_response.country.iso_code
     except (geoip2.errors.AddressNotFoundError, Exception):
-        pass  # country stays None — caller should handle gracefully
+        pass
 
     # ASN lookup
     try:
-        with geoip2.database.Reader(settings.GEOIP_ASN_PATH) as reader:
-            asn_response = reader.asn(ip)
-            result["asn"] = f"AS{asn_response.autonomous_system_number}"  # e.g. "AS17557"
-            result["isp"] = asn_response.autonomous_system_organization    # e.g. "PTCL"
+        if _geoip_asn_reader:
+            asn_response = _geoip_asn_reader.asn(ip)
+            result["asn"] = f"AS{asn_response.autonomous_system_number}"
+            result["isp"] = asn_response.autonomous_system_organization
     except (geoip2.errors.AddressNotFoundError, Exception):
-        pass  # asn stays None — caller should handle gracefully
+        pass
 
     return result
 
