@@ -177,8 +177,8 @@ class DecisionEngine:
             scored.append({**srv, "load_score_computed": score})
 
         scored.sort(key=lambda s: (
-            -s["load_score_computed"],
-            not s["server"].is_priority_group,
+            not s["server"].is_priority_group,  # priority servers always first
+            -s["load_score_computed"],           # within each tier, best load score first
             s["server"].load_score,
             s["server"].id,
         ))
