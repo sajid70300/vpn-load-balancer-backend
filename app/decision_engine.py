@@ -807,6 +807,13 @@ class DecisionEngine:
         hard_ttl:      int,
         asn_threshold: int,
     ):
+        # A cooldown_*_seconds of 0 (or less) means that level is disabled.
+        # Redis SETEX/EXPIRE reject non-positive TTLs ("invalid expire time"),
+        # so without this guard a 0 setting crashes every both-protocols-failed
+        # feedback call with an unhandled ResponseError -> 500.
+        if soft_ttl <= 0 and hard_ttl <= 0:
+            return
+
         redis       = await get_redis()
         asn_key     = _cd_asn_key(server_ip, country, asn)
         asn_set_key = _cd_asn_set_key(server_ip, country)
@@ -814,12 +821,15 @@ class DecisionEngine:
         current_level = await redis.get(asn_key)
 
         if current_level is None:
-            await redis.setex(asn_key, soft_ttl, "soft")
+            if soft_ttl > 0:
+                await redis.setex(asn_key, soft_ttl, "soft")
         else:
-            await redis.setex(asn_key, hard_ttl, "hard")
+            if hard_ttl > 0:
+                await redis.setex(asn_key, hard_ttl, "hard")
 
+        expiry_ttl = hard_ttl if hard_ttl > 0 else soft_ttl
         await redis.sadd(asn_set_key, asn)
-        await redis.expire(asn_set_key, hard_ttl)
+        await redis.expire(asn_set_key, expiry_ttl)
 
         # Country-wide block check
         failing_asns = await redis.smembers(asn_set_key)
@@ -830,7 +840,7 @@ class DecisionEngine:
             else:
                 await redis.srem(asn_set_key, a)
 
-        if active_count >= asn_threshold:
+        if active_count >= asn_threshold and hard_ttl > 0:
             country_key = _cd_country_key(server_ip, country)
             await redis.setex(country_key, hard_ttl, "hard")
 

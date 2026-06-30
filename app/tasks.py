@@ -567,13 +567,16 @@ def cleanup_stale_shadowsocks_sessions():
     Runs as a safety net for users who disconnect without hitting the endpoint.
     OpenVPN sessions are intentionally untouched.
     """
-    from datetime import timedelta
+    from datetime import timedelta, timezone
 
     SHADOWSOCKS_SESSION_TTL_SECONDS = 3600
 
     db = get_db_session()
     try:
-        cutoff = datetime.utcnow() - timedelta(seconds=SHADOWSOCKS_SESSION_TTL_SECONDS)
+        # Timezone-aware UTC cutoff — a naive datetime here would be silently
+        # reinterpreted using the DB session's configured timezone (not
+        # necessarily UTC), shifting the real cutoff by that offset.
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=SHADOWSOCKS_SESSION_TTL_SECONDS)
 
         stale_sessions = db.query(VPNUserSession).filter(
             VPNUserSession.protocol      == 'shadowsocks',
