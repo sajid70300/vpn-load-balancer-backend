@@ -569,7 +569,7 @@ def cleanup_stale_shadowsocks_sessions():
     """
     from datetime import timedelta, timezone
 
-    SHADOWSOCKS_SESSION_TTL_SECONDS = 3600
+    SHADOWSOCKS_SESSION_TTL_SECONDS = 5400
 
     db = get_db_session()
     try:
