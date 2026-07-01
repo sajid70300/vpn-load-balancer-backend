@@ -87,6 +87,7 @@ def _server_out(server: VPNServer, current_users: int) -> dict:
         "is_priority_group":  server.is_priority_group,
         "monitoring_api_url": server.monitoring_api_url,
         "is_active":          server.is_active,
+        "admin_disabled":     server.admin_disabled,
         "display_order":      server.display_order,
         "current_users":      current_users,
         # OpenVPN
@@ -231,6 +232,9 @@ async def create_server(
         is_priority_group  = payload.is_priority_group,
         monitoring_api_url = payload.monitoring_api_url,
         is_active          = payload.is_active,
+        # If created already inactive, treat it as an intentional admin
+        # choice so the health-check task doesn't auto-activate it later.
+        admin_disabled     = not payload.is_active,
         display_order      = max_order + 1,
         cpu_usage          = 0.0,
         ram_usage          = 0.0,
@@ -286,6 +290,11 @@ async def update_server(
         if val is not None:
             setattr(server, field, val)
 
+    # is_active set explicitly here is an admin decision — keep admin_disabled
+    # in lockstep so the health-check task respects it (see tasks.py).
+    if payload.is_active is not None:
+        server.admin_disabled = not payload.is_active
+
     await db.commit()
     await _clear_caches()
     await audit_log(db, token, action="server.update", resource_type="server",
@@ -333,13 +342,16 @@ async def toggle_server_active(
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_api_key),
 ):
-    """Toggle is_active on the server."""
+    """Toggle is_active on the server. Also sets admin_disabled to match: this
+    is an explicit admin action, so the background health-check task
+    (tasks.py) must never silently reverse it."""
     result = await db.execute(select(VPNServer).where(VPNServer.id == server_id))
     server = result.scalar_one_or_none()
     if not server:
         raise HTTPException(status_code=404, detail="Server not found")
 
     server.is_active = not server.is_active
+    server.admin_disabled = not server.is_active
     await db.commit()
     await _clear_caches()
     await audit_log(db, token, action="server.toggle_active", resource_type="server",
@@ -347,9 +359,10 @@ async def toggle_server_active(
         details={"name": server.name, "is_active": server.is_active})
 
     return {
-        "message":   f"Server {'activated' if server.is_active else 'deactivated'}",
-        "server_id": server_id,
-        "is_active": server.is_active,
+        "message":        f"Server {'activated' if server.is_active else 'deactivated'}",
+        "server_id":      server_id,
+        "is_active":      server.is_active,
+        "admin_disabled": server.admin_disabled,
     }
 
 

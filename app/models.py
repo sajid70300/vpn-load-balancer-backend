@@ -66,6 +66,10 @@ class PhysicalMachine(Base):
     max_capacity   = Column(Integer, default=100)
     monitoring_api_url = Column(String(500), nullable=True)
     is_active      = Column(Boolean, default=True, index=True)
+    # True only when an admin explicitly disabled this machine (toggle/edit).
+    # Distinct from is_active so the automatic health-check task (tasks.py)
+    # never re-activates a machine the admin intentionally turned off.
+    admin_disabled = Column(Boolean, default=False, nullable=False)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
@@ -88,6 +92,11 @@ class VPNServer(Base):
     name          = Column(String(100), nullable=False)
     ip_address    = Column(String(45), nullable=False, index=True)
     is_active     = Column(Boolean, default=True, index=True)
+    # True only when an admin explicitly disabled this server row (toggle/edit,
+    # or inherited from its PhysicalMachine at finalize time). The Celery
+    # health-check task (tasks.py) must never flip is_active back to True on
+    # a row where admin_disabled is True — only a manual re-enable can clear it.
+    admin_disabled = Column(Boolean, default=False, nullable=False)
     max_capacity  = Column(Integer, default=100)
     server_type   = Column(String(10), default='free', index=True)
 

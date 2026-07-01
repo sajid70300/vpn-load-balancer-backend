@@ -208,11 +208,13 @@ async def connection_feedback(
             db.add(VPNUserSession(
                 server_id = feedback.server_id,
                 user_id   = feedback.user_id,
-                device_ip = "0.0.0.0",
+                device_ip = feedback.device_ip or "0.0.0.0",
                 protocol  = 'shadowsocks'
             ))
         else:
             existing.connected_time = datetime.utcnow()
+            if feedback.device_ip:
+                existing.device_ip = feedback.device_ip
         await db.commit()
 
     await delete_cache("best_server_v2:*")

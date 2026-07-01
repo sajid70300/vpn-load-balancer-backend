@@ -242,6 +242,7 @@ async def list_app_servers(
             "max_capacity":        server.max_capacity,
             "is_priority_group":   server.is_priority_group,
             "is_active":           server.is_active,
+            "admin_disabled":      server.admin_disabled,
             "current_users":       session_count,
             "cpu_usage":           round(server.cpu_usage, 2),
             "ram_usage":           round(server.ram_usage, 2),
@@ -315,6 +316,7 @@ async def finalize_server_for_app(
         max_capacity        = machine.max_capacity,
         monitoring_api_url  = machine.monitoring_api_url,
         is_active           = machine.is_active,
+        admin_disabled      = machine.admin_disabled,
         is_priority_group   = payload.is_priority_group,
         # OpenVPN
         management_port     = payload.management_port,

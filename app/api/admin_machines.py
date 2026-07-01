@@ -64,6 +64,7 @@ def _machine_out(m: PhysicalMachine, finalized_apps: list[str] = None, connected
         "max_capacity":        m.max_capacity,
         "monitoring_api_url":  m.monitoring_api_url,
         "is_active":           m.is_active,
+        "admin_disabled":      m.admin_disabled,
         "created_at":          m.created_at,
         "updated_at":          m.updated_at,
         "finalized_apps":      finalized_apps or [],  # which apps this machine is finalized for
@@ -208,6 +209,9 @@ async def create_machine(
         max_capacity       = payload.max_capacity,
         monitoring_api_url = payload.monitoring_api_url,
         is_active          = payload.is_active,
+        # If created already inactive, treat it as an intentional admin
+        # choice so the health-check task doesn't auto-activate it later.
+        admin_disabled     = not payload.is_active,
     )
     db.add(m)
     await db.commit()
@@ -251,6 +255,11 @@ async def update_machine(
         if val is not None:
             setattr(m, field, val)
 
+    # is_active set explicitly here is an admin decision — keep admin_disabled
+    # in lockstep so the health-check task respects it (see tasks.py).
+    if payload.is_active is not None:
+        m.admin_disabled = not payload.is_active
+
     # Propagate shared fields to all linked VPNServer rows
     vs_result = await db.execute(
         select(VPNServer).where(VPNServer.physical_machine_id == machine_id)
@@ -265,7 +274,9 @@ async def update_machine(
         if payload.flag_image_url is not None: row.flag_image_url = payload.flag_image_url
         if payload.max_capacity is not None: row.max_capacity = payload.max_capacity
         if payload.monitoring_api_url is not None: row.monitoring_api_url = payload.monitoring_api_url
-        if payload.is_active    is not None: row.is_active    = payload.is_active
+        if payload.is_active    is not None:
+            row.is_active      = payload.is_active
+            row.admin_disabled = not payload.is_active
 
     await db.commit()
     await db.refresh(m)
@@ -314,6 +325,8 @@ async def toggle_machine_active(
 ):
     """
     Toggle is_active on the machine AND all its linked VPNServer rows atomically.
+    Also sets admin_disabled to match: this is an explicit admin action, so the
+    background health-check task (tasks.py) must never silently reverse it.
     """
     result = await db.execute(select(PhysicalMachine).where(PhysicalMachine.id == machine_id))
     m = result.scalar_one_or_none()
@@ -322,16 +335,18 @@ async def toggle_machine_active(
 
     new_state = not m.is_active
     m.is_active = new_state
+    m.admin_disabled = not new_state
 
     vs_result = await db.execute(
         select(VPNServer).where(VPNServer.physical_machine_id == machine_id)
     )
     for row in vs_result.scalars().all():
         row.is_active = new_state
+        row.admin_disabled = not new_state
 
     await db.commit()
     await audit_log(db, token, action="machine.toggle_active", resource_type="machine",
         resource_id=str(machine_id),
         details={"name": m.name, "is_active": new_state})
 
-    return {"machine_id": machine_id, "is_active": new_state}
+    return {"machine_id": machine_id, "is_active": new_state, "admin_disabled": m.admin_disabled}

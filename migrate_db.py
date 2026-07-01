@@ -17,16 +17,27 @@ from app.models import Base, VPNServer, ProtocolMetrics, CountryPolicy, ISPPolic
 from app.database import sync_engine
 
 
-def check_column_exists(engine, table_name, column_name):
-    """Check if a column exists in a table"""
-    inspector = inspect(engine)
+def check_column_exists(conn, table_name, column_name):
+    """
+    Check if a column exists in a table.
+
+    IMPORTANT: `conn` must be the SAME connection/transaction used for the
+    ALTER TABLE statements in migrate() below — NOT a fresh inspect(engine)
+    call. Opening a second connection here would try to read this table's
+    metadata while the first connection still holds an open ALTER TABLE
+    lock on it (migrate() runs everything in one transaction), which
+    self-blocks forever. Reusing `conn` reads the transaction's own
+    uncommitted changes and never contends with its own lock.
+    """
+    inspector = inspect(conn)
     columns = [col['name'] for col in inspector.get_columns(table_name)]
     return column_name in columns
 
 
-def check_table_exists(engine, table_name):
-    """Check if a table exists"""
-    inspector = inspect(engine)
+def check_table_exists(conn, table_name):
+    """Check if a table exists. See check_column_exists() docstring — must
+    reuse the same connection/transaction as the calling migrate() step."""
+    inspector = inspect(conn)
     return table_name in inspector.get_table_names()
 
 
@@ -44,11 +55,11 @@ def migrate():
             # Step 1: Add new columns to existing vpn_status_vpnserver table
             print("📋 Step 1: Checking VPNServer table...")
             
-            if check_table_exists(engine, 'vpn_status_vpnserver'):
+            if check_table_exists(conn, 'vpn_status_vpnserver'):
                 print("   ✅ Table 'vpn_status_vpnserver' exists")
                 
                 # Add protocol column
-                if not check_column_exists(engine, 'vpn_status_vpnserver', 'protocol'):
+                if not check_column_exists(conn, 'vpn_status_vpnserver', 'protocol'):
                     print("   ➕ Adding 'protocol' column...")
                     conn.execute(text("""
                         ALTER TABLE vpn_status_vpnserver 
@@ -70,7 +81,7 @@ def migrate():
                 ]
                 
                 for col_name, col_type in shadowsocks_columns:
-                    if not check_column_exists(engine, 'vpn_status_vpnserver', col_name):
+                    if not check_column_exists(conn, 'vpn_status_vpnserver', col_name):
                         print(f"   ➕ Adding '{col_name}' column...")
                         conn.execute(text(f"""
                             ALTER TABLE vpn_status_vpnserver 
@@ -85,10 +96,10 @@ def migrate():
             # Step 2: Add protocol column to sessions table
             print("\n📋 Step 2: Checking VPNUserSession table...")
             
-            if check_table_exists(engine, 'vpn_status_vpnusersession'):
+            if check_table_exists(conn, 'vpn_status_vpnusersession'):
                 print("   ✅ Table 'vpn_status_vpnusersession' exists")
                 
-                if not check_column_exists(engine, 'vpn_status_vpnusersession', 'protocol'):
+                if not check_column_exists(conn, 'vpn_status_vpnusersession', 'protocol'):
                     print("   ➕ Adding 'protocol' column...")
                     conn.execute(text("""
                         ALTER TABLE vpn_status_vpnusersession 
@@ -107,7 +118,7 @@ def migrate():
             print("\n📋 Step 3: Creating new tables...")
             
             # Protocol Metrics table
-            if not check_table_exists(engine, 'protocol_metrics'):
+            if not check_table_exists(conn, 'protocol_metrics'):
                 print("   ➕ Creating 'protocol_metrics' table...")
                 Base.metadata.tables['protocol_metrics'].create(engine)
                 print("      ✅ Created 'protocol_metrics' table")
@@ -115,7 +126,7 @@ def migrate():
                 print("      ⏭️  Table 'protocol_metrics' already exists")
             
             # Country Policies table
-            if not check_table_exists(engine, 'country_policies'):
+            if not check_table_exists(conn, 'country_policies'):
                 print("   ➕ Creating 'country_policies' table...")
                 Base.metadata.tables['country_policies'].create(engine)
                 print("      ✅ Created 'country_policies' table")
@@ -123,7 +134,7 @@ def migrate():
                 print("      ⏭️  Table 'country_policies' already exists")
             
             # ISP Policies table
-            if not check_table_exists(engine, 'isp_policies'):
+            if not check_table_exists(conn, 'isp_policies'):
                 print("   ➕ Creating 'isp_policies' table...")
                 Base.metadata.tables['isp_policies'].create(engine)
                 print("      ✅ Created 'isp_policies' table")
@@ -131,7 +142,7 @@ def migrate():
                 print("      ⏭️  Table 'isp_policies' already exists")
 
             # Apps table
-            if not check_table_exists(engine, 'apps'):
+            if not check_table_exists(conn, 'apps'):
                 print("   ➕ Creating 'apps' table...")
                 Base.metadata.tables['apps'].create(engine)
                 print("      ✅ Created 'apps' table")
@@ -139,7 +150,7 @@ def migrate():
                 print("      ⏭️  Table 'apps' already exists")
 
             # Global Settings table
-            if not check_table_exists(engine, 'global_settings'):
+            if not check_table_exists(conn, 'global_settings'):
                 print("   ➕ Creating 'global_settings' table...")
                 Base.metadata.tables['global_settings'].create(engine)
                 conn.execute(text("""
@@ -160,14 +171,49 @@ def migrate():
             else:
                 print("      ⏭️  Table 'global_settings' already exists")
                 # Add enforce_isp_policies column if it was added after initial migration
-                if not check_column_exists(engine, 'global_settings', 'enforce_isp_policies'):
+                if not check_column_exists(conn, 'global_settings', 'enforce_isp_policies'):
                     print("   ➕ Adding 'enforce_isp_policies' column to 'global_settings'...")
                     conn.execute(text("""
                         ALTER TABLE global_settings
                         ADD COLUMN enforce_isp_policies BOOLEAN DEFAULT 1
                     """))
                     print("      ✅ Added 'enforce_isp_policies' column")
-            
+
+            # Step 4: Add admin_disabled columns — tracks intentional admin
+            # disable, separate from is_active (which also reflects live
+            # health-check status). Additive, default FALSE, safe on a live DB.
+            print("\n📋 Step 4: Checking admin_disabled columns...")
+
+            if check_table_exists(conn, 'physical_machines'):
+                if not check_column_exists(conn, 'physical_machines', 'admin_disabled'):
+                    print("   ➕ Adding 'admin_disabled' column to 'physical_machines'...")
+                    conn.execute(text("""
+                        ALTER TABLE physical_machines
+                        ADD COLUMN admin_disabled BOOLEAN NOT NULL DEFAULT FALSE
+                    """))
+                    print("      ✅ Added 'admin_disabled' column to 'physical_machines'")
+                else:
+                    print("      ⏭️  Column 'admin_disabled' already exists on 'physical_machines'")
+
+            if check_table_exists(conn, 'vpn_status_vpnserver'):
+                if not check_column_exists(conn, 'vpn_status_vpnserver', 'admin_disabled'):
+                    print("   ➕ Adding 'admin_disabled' column to 'vpn_status_vpnserver'...")
+                    conn.execute(text("""
+                        ALTER TABLE vpn_status_vpnserver
+                        ADD COLUMN admin_disabled BOOLEAN NOT NULL DEFAULT FALSE
+                    """))
+                    print("      ✅ Added 'admin_disabled' column to 'vpn_status_vpnserver'")
+
+                    # Backfill: any row that is already inactive right now was,
+                    # as far as we can tell, put there by the health checker —
+                    # so default it to FALSE (already the column default) and
+                    # let admins re-toggle anything that should stay disabled.
+                    # We do NOT infer admin_disabled=True from is_active=False
+                    # here, since that would incorrectly freeze every server
+                    # currently down for a real, transient network reason.
+                else:
+                    print("      ⏭️  Column 'admin_disabled' already exists on 'vpn_status_vpnserver'")
+
             print()
             print("=" * 60)
             print("✨ Migration completed successfully!")

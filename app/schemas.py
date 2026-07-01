@@ -77,6 +77,8 @@ class ConnectionFeedback(BaseModel):
 
     server_id is the single unified row id (same for both protocols).
     user_id is required only when shadowsocks is the successful protocol.
+    device_ip is optional and only used when shadowsocks is the successful
+    protocol (Shadowsocks has no server-side IP lookup like OpenVPN does).
     OpenVPN sessions are tracked automatically by the Celery monitoring task.
     """
     server_id: int
@@ -84,6 +86,7 @@ class ConnectionFeedback(BaseModel):
     asn: Optional[str] = None
     network_type: Optional[str] = None   # wifi | mobile
     user_id: Optional[str] = None        # required only when shadowsocks succeeds
+    device_ip: Optional[str] = None      # optional; only used when shadowsocks succeeds
 
     primary_protocol: str                # 'openvpn' or 'shadowsocks'
     primary_success: bool

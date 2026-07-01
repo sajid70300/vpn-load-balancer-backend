@@ -359,14 +359,23 @@ def process_server_group(server_ids: list, inactive_retry_seconds: int = 600):
                     'bytes_sent':     bandwidth['bytes_sent'],
                 }
 
-            # Notify if this server was previously inactive (check before flipping the flag)
-            if not server.is_active:
-                create_notification_if_needed(
-                    db, 'server_recovered', server,
-                    f"Server '{server.name}' ({server.ip_address}) is back online and has been marked active."
-                )
-            server.is_active = True
-            # Server recovered — clear any inactive cooldown
+            # Admin-disabled rows must never be auto-reactivated by the health
+            # check — only a manual re-enable (via the dashboard/API) may clear
+            # admin_disabled. This is the fix for servers silently flipping
+            # back to "active" a few seconds after being manually turned off.
+            if not server.admin_disabled:
+                # Notify if this server was previously inactive (check before flipping the flag)
+                if not server.is_active:
+                    create_notification_if_needed(
+                        db, 'server_recovered', server,
+                        f"Server '{server.name}' ({server.ip_address}) is back online and has been marked active."
+                    )
+                server.is_active = True
+
+            # Server's management port is reachable — clear any inactive cooldown
+            # for this group regardless of admin_disabled (a live-infra concern,
+            # not an app-level one). Session syncing also always runs, so
+            # bandwidth/user counts stay accurate even while intentionally disabled.
             cooldown_key = f"inactive_retry:{ip_address}:{management_port}"
             redis_client.delete(cooldown_key)
             sync_server_sessions(db, server, active_users)
@@ -387,8 +396,19 @@ def process_server_group(server_ids: list, inactive_retry_seconds: int = 600):
 
 def fetch_server_metrics(server_id: int):
     """
-    Fetch CPU/RAM/ping metrics from the monitoring API for a single server.
-    Updates the VPNServer row directly.
+    Fetch CPU/RAM/ping metrics from the monitoring API for one physical
+    machine, identified by one of its VPNServer rows (server_id).
+
+    A single physical machine can have multiple VPNServer rows — one per
+    app it has been finalized for — all sharing the same monitoring_api_url.
+    CPU/RAM/ping are physical-machine facts, not app-specific, so the ONE
+    reading fetched here is applied to EVERY VPNServer row sharing this
+    monitoring_api_url (previously only the row passed in was updated,
+    leaving sibling rows permanently stale/inconsistent).
+
+    load_score and the capacity-reached check remain per-row, since session
+    counts (and therefore load and capacity usage) are per app, not shared.
+
     If the API fails (timeout, error, non-200), a cooldown key is set in Redis
     so the URL is skipped for METRICS_API_RETRY_MINUTES minutes.
     """
@@ -398,11 +418,12 @@ def fetch_server_metrics(server_id: int):
         if not server or not server.monitoring_api_url:
             return
 
-        cooldown_key  = f"metrics_retry:{server.monitoring_api_url}"
+        monitoring_api_url = server.monitoring_api_url
+        cooldown_key  = f"metrics_retry:{monitoring_api_url}"
         retry_seconds = settings.METRICS_API_RETRY_MINUTES * 60
 
         try:
-            response = requests.get(f"{server.monitoring_api_url}/metrics", timeout=5)
+            response = requests.get(f"{monitoring_api_url}/metrics", timeout=5)
             if response.status_code == 200:
                 data         = response.json()
                 current_time = datetime.utcnow()
@@ -410,36 +431,43 @@ def fetch_server_metrics(server_id: int):
                 ram_usage    = data.get('ram_percent', 0.0)
                 ping_ms      = data.get('ping_ms', 0.0)
 
-                server.cpu_usage         = cpu_usage
-                server.ram_usage         = ram_usage
-                server.ping_latency_ms   = ping_ms
-                server.last_health_check = current_time
+                # All VPNServer rows for this same physical machine — includes `server` itself.
+                sibling_rows = db.query(VPNServer).filter(
+                    VPNServer.monitoring_api_url == monitoring_api_url
+                ).all()
 
-                if cpu_usage > server.peak_cpu:
-                    server.peak_cpu      = cpu_usage
-                    server.peak_cpu_time = current_time
+                for row in sibling_rows:
+                    row.cpu_usage         = cpu_usage
+                    row.ram_usage         = ram_usage
+                    row.ping_latency_ms   = ping_ms
+                    row.last_health_check = current_time
 
-                if ram_usage > server.peak_ram:
-                    server.peak_ram      = ram_usage
-                    server.peak_ram_time = current_time
+                    if cpu_usage > row.peak_cpu:
+                        row.peak_cpu      = cpu_usage
+                        row.peak_cpu_time = current_time
 
-                # Load score uses all sessions on this server row
-                session_count = db.query(VPNUserSession).filter(
-                    VPNUserSession.server_id == server.id
-                ).count()
-                server.load_score = calculate_load_score(server, session_count)
+                    if ram_usage > row.peak_ram:
+                        row.peak_ram      = ram_usage
+                        row.peak_ram_time = current_time
 
-                if server.max_capacity > 0 and session_count >= server.max_capacity:
-                    create_notification_if_needed(
-                        db, 'capacity_reached', server,
-                        f"Server '{server.name}' ({server.ip_address}) has reached its maximum "
-                        f"capacity of {server.max_capacity} sessions ({session_count} active)."
-                    )
+                    # Load score uses this row's own sessions (per app)
+                    session_count = db.query(VPNUserSession).filter(
+                        VPNUserSession.server_id == row.id
+                    ).count()
+                    row.load_score = calculate_load_score(row, session_count)
+
+                    if row.max_capacity > 0 and session_count >= row.max_capacity:
+                        create_notification_if_needed(
+                            db, 'capacity_reached', row,
+                            f"Server '{row.name}' ({row.ip_address}) has reached its maximum "
+                            f"capacity of {row.max_capacity} sessions ({session_count} active)."
+                        )
 
                 db.commit()
                 # API responded successfully — clear any existing cooldown
                 redis_client.delete(cooldown_key)
-                print(f"✅ {server.name}: CPU={cpu_usage:.1f}% RAM={ram_usage:.1f}% Ping={ping_ms:.1f}ms")
+                print(f"✅ {monitoring_api_url}: CPU={cpu_usage:.1f}% RAM={ram_usage:.1f}% Ping={ping_ms:.1f}ms "
+                      f"→ applied to {len(sibling_rows)} row(s)")
             else:
                 # Non-200 response — set cooldown
                 redis_client.set(cooldown_key, "1", ex=retry_seconds)
