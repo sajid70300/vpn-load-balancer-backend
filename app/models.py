@@ -312,3 +312,37 @@ class Notification(Base):
 
     is_read    = Column(Boolean, default=False, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class SystemPeakStats(Base):
+    """
+    Single-row table (id always 1) tracking the all-time peak number of
+    concurrent active sessions across the whole system, and when it happened.
+
+    Updated frequently (every ~60s) by a dedicated Celery task
+    (track_active_users_snapshot in tasks.py) — kept completely separate
+    from VPNServer/session logic so this feature can never affect server
+    health-check or session-sync behaviour.
+    """
+    __tablename__ = "system_peak_stats"
+
+    id         = Column(Integer, primary_key=True, default=1)
+    peak_users = Column(Integer, default=0, nullable=False)
+    peak_at    = Column(DateTime(timezone=True), nullable=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class ActiveUsersHistory(Base):
+    """
+    One row roughly every 2 hours recording total active sessions at that
+    moment, for the VPN Server Analytics 'History' trend chart.
+
+    The 2-hour interval is enforced by the Celery task (Redis-gated), not by
+    anything in this model — kept deliberately coarse-grained (~12 rows/day)
+    so this table stays tiny regardless of traffic volume.
+    """
+    __tablename__ = "active_users_history"
+
+    id          = Column(Integer, primary_key=True, index=True)
+    recorded_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    total_users = Column(Integer, nullable=False)

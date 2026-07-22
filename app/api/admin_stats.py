@@ -5,14 +5,16 @@ Admin API - Statistics & Data Export
 from fastapi import APIRouter, Depends, Query, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, and_
+from sqlalchemy import select, func, and_, cast, Date
 from sqlalchemy.orm import selectinload
 from typing import Optional
+from datetime import datetime, timedelta, timezone
+from calendar import monthrange
 import io
 import csv
 
 from app.database import get_db
-from app.models import VPNServer, VPNUserSession
+from app.models import VPNServer, VPNUserSession, SystemPeakStats, ActiveUsersHistory
 from app.auth import verify_api_key
 
 router = APIRouter(prefix="/admin", tags=["Admin - Stats & Export"])
@@ -129,6 +131,112 @@ async def get_app_stats(
         })
 
     return {"apps": app_stats}
+
+
+@router.get("/stats/peak-users")
+async def get_peak_users(
+    db: AsyncSession = Depends(get_db),
+    _: str = Depends(verify_api_key)
+):
+    """
+    All-time peak concurrent active-user count and when it happened.
+    Updated by a dedicated Celery task every ~60s
+    (see app/tasks.py: track_active_users_snapshot()).
+    """
+    result = await db.execute(select(SystemPeakStats).where(SystemPeakStats.id == 1))
+    row = result.scalar_one_or_none()
+
+    if not row:
+        return {"peak_users": 0, "peak_at": None}
+
+    return {"peak_users": row.peak_users, "peak_at": row.peak_at}
+
+
+@router.get("/stats/user-history")
+async def get_user_history(
+    range: str = Query("7d", pattern="^(24h|7d|30d|all)$"),
+    db: AsyncSession = Depends(get_db),
+    _: str = Depends(verify_api_key)
+):
+    """
+    Active-user snapshots recorded roughly every 2 hours, for the VPN Server
+    Analytics 'History' trend chart.
+    range: 24h | 7d | 30d | all (default 7d).
+    """
+    query = select(ActiveUsersHistory).order_by(ActiveUsersHistory.recorded_at.asc())
+
+    if range != "all":
+        hours_map = {"24h": 24, "7d": 24 * 7, "30d": 24 * 30}
+        cutoff = datetime.utcnow() - timedelta(hours=hours_map[range])
+        query = query.where(ActiveUsersHistory.recorded_at >= cutoff)
+
+    result = await db.execute(query)
+    rows = result.scalars().all()
+
+    return {
+        "range": range,
+        "points": [
+            {"recorded_at": r.recorded_at, "total_users": r.total_users}
+            for r in rows
+        ],
+    }
+
+
+@router.get("/stats/daily-peaks")
+async def get_daily_peaks(
+    month: str = Query(..., pattern="^[0-9]{4}-(0[1-9]|1[0-2])$", description="YYYY-MM"),
+    db: AsyncSession = Depends(get_db),
+    _: str = Depends(verify_api_key)
+):
+    """
+    One peak-users value per calendar day for the given month — a
+    'when were we busier/quieter' record.
+
+    Deliberately derived from data we already have (active_users_history,
+    recorded every ~2 hours) via a day-level MAX() aggregation — no new
+    table, no new Celery task. Trade-off: if a day's true peak happened
+    between two snapshots, this can slightly understate it. Acceptable for
+    a rough historical record; not intended as an exact/audited figure.
+
+    Only returns days up to today for the current month (future days
+    haven't happened yet, so they're omitted rather than shown as a
+    misleading zero).
+    """
+    year, mon = map(int, month.split("-"))
+    days_in_month = monthrange(year, mon)[1]
+
+    now_utc = datetime.now(timezone.utc)
+    if (year, mon) > (now_utc.year, now_utc.month):
+        days_to_generate = 0
+    elif (year, mon) == (now_utc.year, now_utc.month):
+        days_to_generate = now_utc.day
+    else:
+        days_to_generate = days_in_month
+
+    if days_to_generate == 0:
+        return {"month": month, "days": []}
+
+    month_start = datetime(year, mon, 1, tzinfo=timezone.utc)
+    month_end   = datetime(year, mon, days_to_generate, 23, 59, 59, tzinfo=timezone.utc)
+
+    day_col = cast(ActiveUsersHistory.recorded_at, Date)
+    query = (
+        select(day_col.label("day"), func.max(ActiveUsersHistory.total_users).label("peak_users"))
+        .where(and_(
+            ActiveUsersHistory.recorded_at >= month_start,
+            ActiveUsersHistory.recorded_at <= month_end,
+        ))
+        .group_by(day_col)
+    )
+    result = await db.execute(query)
+    peaks_by_day = {row.day.isoformat(): row.peak_users for row in result.all()}
+
+    days = []
+    for d in range(1, days_to_generate + 1):
+        day_str = f"{year:04d}-{mon:02d}-{d:02d}"
+        days.append({"day": day_str, "peak_users": peaks_by_day.get(day_str, 0)})
+
+    return {"month": month, "days": days}
 
 
 @router.get("/export/servers")

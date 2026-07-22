@@ -13,7 +13,7 @@ from datetime import datetime
 from sqlalchemy import select, and_, update, delete
 from sqlalchemy.orm import Session
 from app.database import SyncSessionLocal
-from app.models import VPNServer, VPNUserSession, Notification
+from app.models import VPNServer, VPNUserSession, Notification, SystemPeakStats, ActiveUsersHistory
 from app.config import settings
 import redis
 
@@ -625,6 +625,65 @@ def cleanup_stale_shadowsocks_sessions():
         print(f"❌ Error cleaning up stale Shadowsocks sessions: {e}")
     finally:
         db.close()
+
+
+def track_active_users_snapshot():
+    """
+    Independent, lightweight tracking task — deliberately isolated from
+    monitor_vpn_status() / fetch_server_metrics() so a bug or slowdown here
+    can never affect VPN server up/down detection or session syncing.
+
+    Runs frequently (every ~60s — see celery_app.py beat schedule) to:
+      1. Update the all-time peak concurrent-user count (system_peak_stats)
+         the instant it's exceeded — checked every run so a brief spike is
+         never missed.
+      2. Every ~2 hours (Redis-gated, independent of task frequency), insert
+         one snapshot row into active_users_history for the trend chart on
+         the VPN Server Analytics page. Deliberately coarse-grained
+         (~12 rows/day) so this table stays tiny regardless of traffic.
+    """
+    lock_id = "track_active_users_lock"
+    lock_timeout = 30
+
+    if not redis_client.set(lock_id, "locked", nx=True, ex=lock_timeout):
+        return  # previous run still in progress — skip this cycle
+
+    try:
+        db = get_db_session()
+        try:
+            # True total via COUNT(*) — same accurate source used by
+            # /all_users/, not a client-side sum of a paginated list.
+            current_total = db.query(VPNUserSession).count()
+
+            # ── 1. All-time peak — checked every run ──────────────────────
+            peak_row = db.query(SystemPeakStats).filter(SystemPeakStats.id == 1).first()
+            if not peak_row:
+                peak_row = SystemPeakStats(id=1, peak_users=0, peak_at=None)
+                db.add(peak_row)
+                db.flush()
+
+            if current_total > peak_row.peak_users:
+                peak_row.peak_users = current_total
+                peak_row.peak_at = datetime.utcnow()
+                print(f"🏔️  New all-time peak active users: {current_total}")
+
+            # ── 2. History snapshot — gated to once per 2 hours ───────────
+            HISTORY_INTERVAL_SECONDS = 2 * 60 * 60
+            gate_key = "active_users_history_gate"
+
+            if not redis_client.exists(gate_key):
+                db.add(ActiveUsersHistory(total_users=current_total))
+                redis_client.set(gate_key, "1", ex=HISTORY_INTERVAL_SECONDS)
+                print(f"📸 Active-users history snapshot recorded: {current_total}")
+
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            print(f"❌ Error in track_active_users_snapshot: {e}")
+        finally:
+            db.close()
+    finally:
+        redis_client.delete(lock_id)
 
 
 def update_geoip_databases():
