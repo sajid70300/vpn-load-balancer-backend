@@ -314,19 +314,40 @@ class Notification(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
 
 
+
+
+# Sentinel app_name value representing the combined "All Apps" total in
+# SystemPeakStats / ActiveUsersHistory, alongside real per-app rows. Chosen
+# to be extremely unlikely to collide with a real app_name (which follow an
+# "app_x" convention throughout this codebase). This value is only ever
+# looked up directly (as a key) — it is never pattern-matched or parsed, so
+# an accidental real app named the same string would simply behave like any
+# other app row, not corrupt anything.
+ALL_APPS_KEY = "__all_apps__"
+
+
 class SystemPeakStats(Base):
     """
-    Single-row table (id always 1) tracking the all-time peak number of
-    concurrent active sessions across the whole system, and when it happened.
+    Tracks the all-time peak number of concurrent active sessions, and when
+    it happened — one row per app_name, plus one row keyed ALL_APPS_KEY for
+    the combined total across every app.
 
     Updated frequently (every ~60s) by a dedicated Celery task
     (track_active_users_snapshot in tasks.py) — kept completely separate
     from VPNServer/session logic so this feature can never affect server
     health-check or session-sync behaviour.
+
+    Per-app rows are created/discovered dynamically from whatever app_name
+    values currently exist on VPNServer — there is no hardcoded app list, so
+    apps added or removed in the dashboard are picked up automatically with
+    no code change. The ALL_APPS_KEY row's value is computed independently
+    (a plain count of every session, unfiltered) so it keeps meaning exactly
+    what it always has — not a sum of the per-app rows.
     """
     __tablename__ = "system_peak_stats"
 
-    id         = Column(Integer, primary_key=True, default=1)
+    id         = Column(Integer, primary_key=True)
+    app_name   = Column(String(100), nullable=False, unique=True)
     peak_users = Column(Integer, default=0, nullable=False)
     peak_at    = Column(DateTime(timezone=True), nullable=True)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
@@ -334,15 +355,23 @@ class SystemPeakStats(Base):
 
 class ActiveUsersHistory(Base):
     """
-    One row roughly every 2 hours recording total active sessions at that
-    moment, for the VPN Server Analytics 'History' trend chart.
+    One row roughly every 30 minutes recording total active sessions at
+    that moment, for the VPN Server Analytics 'History' trend chart — one
+    row per app_name per snapshot, plus one row keyed ALL_APPS_KEY for the
+    combined total, computed the same independent way as SystemPeakStats
+    above (not reconstructed from the per-app rows).
 
-    The 2-hour interval is enforced by the Celery task (Redis-gated), not by
-    anything in this model — kept deliberately coarse-grained (~12 rows/day)
-    so this table stays tiny regardless of traffic volume.
+    The 30-minute interval is enforced by the Celery task (Redis-gated),
+    not by anything in this model — still deliberately coarse-grained
+    (~48 rows/day per app) so this table stays small regardless of traffic.
     """
     __tablename__ = "active_users_history"
 
     id          = Column(Integer, primary_key=True, index=True)
+    app_name    = Column(String(100), nullable=False, index=True)
     recorded_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
     total_users = Column(Integer, nullable=False)
+
+    __table_args__ = (
+        Index('ix_active_users_history_app_recorded', 'app_name', 'recorded_at'),
+    )

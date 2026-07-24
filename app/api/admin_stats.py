@@ -14,7 +14,7 @@ import io
 import csv
 
 from app.database import get_db
-from app.models import VPNServer, VPNUserSession, SystemPeakStats, ActiveUsersHistory
+from app.models import VPNServer, VPNUserSession, SystemPeakStats, ActiveUsersHistory, ALL_APPS_KEY
 from app.auth import verify_api_key
 
 router = APIRouter(prefix="/admin", tags=["Admin - Stats & Export"])
@@ -135,35 +135,45 @@ async def get_app_stats(
 
 @router.get("/stats/peak-users")
 async def get_peak_users(
+    app_name: Optional[str] = Query(None, description="Specific app name; omit for All Apps combined"),
     db: AsyncSession = Depends(get_db),
     _: str = Depends(verify_api_key)
 ):
     """
-    All-time peak concurrent active-user count and when it happened.
+    Peak concurrent active-user count and when it happened, for the given
+    app (or the combined "All Apps" total if app_name is omitted).
     Updated by a dedicated Celery task every ~60s
     (see app/tasks.py: track_active_users_snapshot()).
     """
-    result = await db.execute(select(SystemPeakStats).where(SystemPeakStats.id == 1))
+    key = app_name if app_name else ALL_APPS_KEY
+    result = await db.execute(select(SystemPeakStats).where(SystemPeakStats.app_name == key))
     row = result.scalar_one_or_none()
 
     if not row:
-        return {"peak_users": 0, "peak_at": None}
+        return {"app_name": app_name, "peak_users": 0, "peak_at": None}
 
-    return {"peak_users": row.peak_users, "peak_at": row.peak_at}
+    return {"app_name": app_name, "peak_users": row.peak_users, "peak_at": row.peak_at}
 
 
 @router.get("/stats/user-history")
 async def get_user_history(
     range: str = Query("7d", pattern="^(24h|7d|30d|all)$"),
+    app_name: Optional[str] = Query(None, description="Specific app name; omit for All Apps combined"),
     db: AsyncSession = Depends(get_db),
     _: str = Depends(verify_api_key)
 ):
     """
-    Active-user snapshots recorded roughly every 2 hours, for the VPN Server
-    Analytics 'History' trend chart.
+    Active-user snapshots recorded roughly every 30 minutes, for the given
+    app (or the combined "All Apps" total if app_name is omitted), for the
+    VPN Server Analytics 'History' trend chart.
     range: 24h | 7d | 30d | all (default 7d).
     """
-    query = select(ActiveUsersHistory).order_by(ActiveUsersHistory.recorded_at.asc())
+    key = app_name if app_name else ALL_APPS_KEY
+    query = (
+        select(ActiveUsersHistory)
+        .where(ActiveUsersHistory.app_name == key)
+        .order_by(ActiveUsersHistory.recorded_at.asc())
+    )
 
     if range != "all":
         hours_map = {"24h": 24, "7d": 24 * 7, "30d": 24 * 30}
@@ -175,6 +185,7 @@ async def get_user_history(
 
     return {
         "range": range,
+        "app_name": app_name,
         "points": [
             {"recorded_at": r.recorded_at, "total_users": r.total_users}
             for r in rows
@@ -185,15 +196,17 @@ async def get_user_history(
 @router.get("/stats/daily-peaks")
 async def get_daily_peaks(
     month: str = Query(..., pattern="^[0-9]{4}-(0[1-9]|1[0-2])$", description="YYYY-MM"),
+    app_name: Optional[str] = Query(None, description="Specific app name; omit for All Apps combined"),
     db: AsyncSession = Depends(get_db),
     _: str = Depends(verify_api_key)
 ):
     """
-    One peak-users value per calendar day for the given month — a
-    'when were we busier/quieter' record.
+    One peak-users value per calendar day for the given month, for the
+    given app (or the combined "All Apps" total if app_name is omitted) —
+    a 'when were we busier/quieter' record.
 
     Deliberately derived from data we already have (active_users_history,
-    recorded every ~2 hours) via a day-level MAX() aggregation — no new
+    recorded every ~30 minutes) via a day-level MAX() aggregation — no new
     table, no new Celery task. Trade-off: if a day's true peak happened
     between two snapshots, this can slightly understate it. Acceptable for
     a rough historical record; not intended as an exact/audited figure.
@@ -202,6 +215,7 @@ async def get_daily_peaks(
     haven't happened yet, so they're omitted rather than shown as a
     misleading zero).
     """
+    key = app_name if app_name else ALL_APPS_KEY
     year, mon = map(int, month.split("-"))
     days_in_month = monthrange(year, mon)[1]
 
@@ -214,7 +228,7 @@ async def get_daily_peaks(
         days_to_generate = days_in_month
 
     if days_to_generate == 0:
-        return {"month": month, "days": []}
+        return {"month": month, "app_name": app_name, "days": []}
 
     month_start = datetime(year, mon, 1, tzinfo=timezone.utc)
     month_end   = datetime(year, mon, days_to_generate, 23, 59, 59, tzinfo=timezone.utc)
@@ -223,6 +237,7 @@ async def get_daily_peaks(
     query = (
         select(day_col.label("day"), func.max(ActiveUsersHistory.total_users).label("peak_users"))
         .where(and_(
+            ActiveUsersHistory.app_name == key,
             ActiveUsersHistory.recorded_at >= month_start,
             ActiveUsersHistory.recorded_at <= month_end,
         ))
@@ -236,7 +251,7 @@ async def get_daily_peaks(
         day_str = f"{year:04d}-{mon:02d}-{d:02d}"
         days.append({"day": day_str, "peak_users": peaks_by_day.get(day_str, 0)})
 
-    return {"month": month, "days": days}
+    return {"month": month, "app_name": app_name, "days": days}
 
 
 @router.get("/export/servers")

@@ -10,10 +10,10 @@ import socket
 import time
 import requests
 from datetime import datetime
-from sqlalchemy import select, and_, update, delete
+from sqlalchemy import select, and_, update, delete, func
 from sqlalchemy.orm import Session
 from app.database import SyncSessionLocal
-from app.models import VPNServer, VPNUserSession, Notification, SystemPeakStats, ActiveUsersHistory
+from app.models import VPNServer, VPNUserSession, Notification, SystemPeakStats, ActiveUsersHistory, ALL_APPS_KEY
 from app.config import settings
 import redis
 
@@ -634,13 +634,26 @@ def track_active_users_snapshot():
     can never affect VPN server up/down detection or session syncing.
 
     Runs frequently (every ~60s — see celery_app.py beat schedule) to:
-      1. Update the all-time peak concurrent-user count (system_peak_stats)
-         the instant it's exceeded — checked every run so a brief spike is
-         never missed.
-      2. Every ~2 hours (Redis-gated, independent of task frequency), insert
-         one snapshot row into active_users_history for the trend chart on
-         the VPN Server Analytics page. Deliberately coarse-grained
-         (~12 rows/day) so this table stays tiny regardless of traffic.
+      1. Update the peak concurrent-user count for every app, plus the
+         combined "All Apps" total (system_peak_stats) — checked every run
+         so a brief spike is never missed.
+      2. Every ~30 minutes (Redis-gated, independent of task frequency),
+         insert one snapshot row per app plus one combined row into
+         active_users_history for the trend/daily-peak charts.
+
+    Per-app breakdown is derived dynamically from whatever app_name values
+    currently exist on VPNServer rows with sessions — there is no hardcoded
+    app list, so an app added or removed in the dashboard is picked up
+    automatically with no code change: a new app simply starts appearing
+    here as soon as it has its first session; a removed app just stops
+    appearing (its historical rows and peak stay as they were, nothing
+    errors).
+
+    The combined "All Apps" total is deliberately NOT reconstructed from
+    the per-app numbers (e.g. by summing them) — it's computed the same
+    independent way it always was (a plain count of every session,
+    unfiltered), so the existing All-Apps peak/history figures keep
+    meaning exactly what they always have.
     """
     lock_id = "track_active_users_lock"
     lock_timeout = 30
@@ -651,30 +664,47 @@ def track_active_users_snapshot():
     try:
         db = get_db_session()
         try:
-            # True total via COUNT(*) — same accurate source used by
-            # /all_users/, not a client-side sum of a paginated list.
-            current_total = db.query(VPNUserSession).count()
+            now = datetime.utcnow()
 
-            # ── 1. All-time peak — checked every run ──────────────────────
-            peak_row = db.query(SystemPeakStats).filter(SystemPeakStats.id == 1).first()
-            if not peak_row:
-                peak_row = SystemPeakStats(id=1, peak_users=0, peak_at=None)
-                db.add(peak_row)
-                db.flush()
+            # Combined total — same accurate, unfiltered COUNT(*) as before.
+            combined_total = db.query(VPNUserSession).count()
 
-            if current_total > peak_row.peak_users:
-                peak_row.peak_users = current_total
-                peak_row.peak_at = datetime.utcnow()
-                print(f"🏔️  New all-time peak active users: {current_total}")
+            # Per-app breakdown — dynamically grouped, no hardcoded app list.
+            app_rows = (
+                db.query(VPNServer.app_name, func.count(VPNUserSession.id))
+                .join(VPNUserSession, VPNUserSession.server_id == VPNServer.id)
+                .filter(VPNServer.app_name.isnot(None))
+                .group_by(VPNServer.app_name)
+                .all()
+            )
+            per_app_counts = {app_name: count for app_name, count in app_rows}
 
-            # ── 2. History snapshot — gated to once per 2 hours ───────────
-            HISTORY_INTERVAL_SECONDS = 2 * 60 * 60
+            targets = dict(per_app_counts)
+            targets[ALL_APPS_KEY] = combined_total
+
+            # ── 1. Peak tracking — checked every run, for every app + combined ──
+            for app_key, current_total in targets.items():
+                peak_row = db.query(SystemPeakStats).filter(SystemPeakStats.app_name == app_key).first()
+                if not peak_row:
+                    peak_row = SystemPeakStats(app_name=app_key, peak_users=0, peak_at=None)
+                    db.add(peak_row)
+                    db.flush()
+
+                if current_total > peak_row.peak_users:
+                    peak_row.peak_users = current_total
+                    peak_row.peak_at = now
+                    print(f"🏔️  New peak for {app_key}: {current_total}")
+
+            # ── 2. History snapshot — gated to once per 30 minutes ─────────
+            HISTORY_INTERVAL_SECONDS = 30 * 60
             gate_key = "active_users_history_gate"
 
             if not redis_client.exists(gate_key):
-                db.add(ActiveUsersHistory(total_users=current_total))
+                db.add(ActiveUsersHistory(app_name=ALL_APPS_KEY, total_users=combined_total, recorded_at=now))
+                for app_name, count in per_app_counts.items():
+                    db.add(ActiveUsersHistory(app_name=app_name, total_users=count, recorded_at=now))
                 redis_client.set(gate_key, "1", ex=HISTORY_INTERVAL_SECONDS)
-                print(f"📸 Active-users history snapshot recorded: {current_total}")
+                print(f"📸 History snapshot recorded ({len(per_app_counts)} app(s) + combined)")
 
             db.commit()
         except Exception as e:
