@@ -274,6 +274,7 @@ class GlobalSettingsResponse(BaseModel):
     cooldown_hard_seconds: int
     failure_rate_threshold: float
     cooldown_country_block_asn_threshold: int
+    history_interval_minutes: int = 30
     updated_at: Optional[datetime] = None
 
 
@@ -287,6 +288,7 @@ class GlobalSettingsUpdate(BaseModel):
     cooldown_hard_seconds: Optional[int] = None
     failure_rate_threshold: Optional[float] = None
     cooldown_country_block_asn_threshold: Optional[int] = None
+    history_interval_minutes: Optional[int] = None
 
 
 # ==================== Legacy / Public API Schemas ====================

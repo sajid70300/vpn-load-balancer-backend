@@ -13,7 +13,7 @@ from datetime import datetime
 from sqlalchemy import select, and_, update, delete, func
 from sqlalchemy.orm import Session
 from app.database import SyncSessionLocal
-from app.models import VPNServer, VPNUserSession, Notification, SystemPeakStats, ActiveUsersHistory, ALL_APPS_KEY
+from app.models import VPNServer, VPNUserSession, Notification, SystemPeakStats, ActiveUsersHistory, GlobalSettings, ALL_APPS_KEY
 from app.config import settings
 import redis
 
@@ -627,6 +627,35 @@ def cleanup_stale_shadowsocks_sessions():
         db.close()
 
 
+DEFAULT_HISTORY_INTERVAL_MINUTES = 30
+HISTORY_LAST_SNAPSHOT_KEY = "active_users_history_last_snapshot_ts"
+# The task ticks every ~60s (with a little scheduling jitter). A snapshot is
+# "due" slightly before the exact interval so jitter can't push a 1-minute
+# interval into a 2-minute cadence. Must stay well below the 60s tick period.
+HISTORY_DUE_TOLERANCE_SECONDS = 15
+
+
+def get_history_interval_minutes() -> int:
+    """
+    Configured snapshot interval (minutes) from global_settings, set from the
+    dashboard. Uses its own short-lived session and falls back to the default
+    on ANY problem (missing column/row, DB hiccup, bad value) so a settings
+    issue can never stop peak tracking or snapshots.
+    """
+    try:
+        db = get_db_session()
+        try:
+            value = db.query(GlobalSettings.history_interval_minutes).filter(GlobalSettings.id == 1).scalar()
+        finally:
+            db.close()
+        value = int(value) if value is not None else DEFAULT_HISTORY_INTERVAL_MINUTES
+        if 1 <= value <= 1440:
+            return value
+    except Exception as e:
+        print(f"⚠️  Could not read history interval, using default: {e}")
+    return DEFAULT_HISTORY_INTERVAL_MINUTES
+
+
 def track_active_users_snapshot():
     """
     Independent, lightweight tracking task — deliberately isolated from
@@ -662,6 +691,7 @@ def track_active_users_snapshot():
         return  # previous run still in progress — skip this cycle
 
     try:
+        interval_minutes = get_history_interval_minutes()
         db = get_db_session()
         try:
             now = datetime.utcnow()
@@ -695,18 +725,30 @@ def track_active_users_snapshot():
                     peak_row.peak_at = now
                     print(f"🏔️  New peak for {app_key}: {current_total}")
 
-            # ── 2. History snapshot — gated to once per 30 minutes ─────────
-            HISTORY_INTERVAL_SECONDS = 30 * 60
-            gate_key = "active_users_history_gate"
+            # ── 2. History snapshot — gated by the configured interval ─────
+            # The last-snapshot time is kept in Redis (no expiry) and compared
+            # with the CURRENT interval on every run, so a changed interval
+            # takes effect on the very next tick instead of waiting for an old
+            # gate to expire.
+            snapshot_due = False
+            try:
+                last_ts = redis_client.get(HISTORY_LAST_SNAPSHOT_KEY)
+                elapsed = time.time() - float(last_ts) if last_ts is not None else None
+                snapshot_due = elapsed is None or elapsed >= (interval_minutes * 60 - HISTORY_DUE_TOLERANCE_SECONDS)
+            except Exception:
+                snapshot_due = True  # unreadable/garbled key — record now, then rewrite it
 
-            if not redis_client.exists(gate_key):
+            if snapshot_due:
                 db.add(ActiveUsersHistory(app_name=ALL_APPS_KEY, total_users=combined_total, recorded_at=now))
                 for app_name, count in per_app_counts.items():
                     db.add(ActiveUsersHistory(app_name=app_name, total_users=count, recorded_at=now))
-                redis_client.set(gate_key, "1", ex=HISTORY_INTERVAL_SECONDS)
-                print(f"📸 History snapshot recorded ({len(per_app_counts)} app(s) + combined)")
 
             db.commit()
+
+            # Only mark the snapshot as taken once it has been committed.
+            if snapshot_due:
+                redis_client.set(HISTORY_LAST_SNAPSHOT_KEY, str(time.time()))
+                print(f"📸 History snapshot recorded ({len(per_app_counts)} app(s) + combined, interval={interval_minutes}m)")
         except Exception as e:
             db.rollback()
             print(f"❌ Error in track_active_users_snapshot: {e}")

@@ -6,7 +6,7 @@ system-wide: protocol mode, emergency overrides, cooldown timers.
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.database import get_db
 from app.models import GlobalSettings
@@ -18,6 +18,12 @@ from app.cache import get_cache, set_cache, delete_cache
 router = APIRouter(prefix="/admin/settings", tags=["Admin - Global Settings"])
 
 VALID_PROTOCOL_MODES = {'auto', 'force_openvpn', 'force_shadowsocks'}
+
+# Allowed range for the active-user history snapshot interval (minutes).
+# The snapshot task ticks once a minute, so 1 is the smallest meaningful value.
+MIN_HISTORY_INTERVAL_MINUTES = 1
+MAX_HISTORY_INTERVAL_MINUTES = 1440
+DEFAULT_HISTORY_INTERVAL_MINUTES = 30
 
 # Cache key for global settings — long TTL since they change very rarely.
 # Invalidated explicitly on every PUT so staleness is never an issue.
@@ -38,6 +44,24 @@ def _to_response(s: GlobalSettings) -> GlobalSettingsResponse:
         cooldown_country_block_asn_threshold=s.cooldown_country_block_asn_threshold,
         updated_at=s.updated_at,
     )
+
+
+async def _read_history_interval(db: AsyncSession) -> int:
+    """
+    Current history snapshot interval in minutes. history_interval_minutes is a
+    deferred column (never loaded with the settings row), so it is read with its
+    own tiny query. If the column doesn't exist yet (migration not applied) fall
+    back to the default instead of failing the whole settings endpoint.
+    """
+    try:
+        result = await db.execute(
+            select(GlobalSettings.history_interval_minutes).where(GlobalSettings.id == 1)
+        )
+        value = result.scalar_one_or_none()
+        return value if value else DEFAULT_HISTORY_INTERVAL_MINUTES
+    except Exception:
+        await db.rollback()
+        return DEFAULT_HISTORY_INTERVAL_MINUTES
 
 
 async def _get_or_create_settings(db: AsyncSession) -> GlobalSettings:
@@ -63,11 +87,14 @@ async def get_global_settings(
     automatically on every PUT so the dashboard always sees the latest value.
     """
     cached = await get_cache(SETTINGS_CACHE_KEY)
-    if cached:
+    # The decision engine shares this cache key and writes a payload without
+    # history_interval_minutes — only serve the cached copy if it has it.
+    if cached and "history_interval_minutes" in cached:
         return cached
 
     s = await _get_or_create_settings(db)
     response = _to_response(s)
+    response.history_interval_minutes = await _read_history_interval(db)
     await set_cache(SETTINGS_CACHE_KEY, response.model_dump(), ttl=SETTINGS_CACHE_TTL)
     return response
 
@@ -135,18 +162,39 @@ async def update_global_settings(
             raise HTTPException(status_code=400, detail="cooldown_country_block_asn_threshold must be >= 1")
         s.cooldown_country_block_asn_threshold = payload.cooldown_country_block_asn_threshold
 
+    if payload.history_interval_minutes is not None:
+        if not (MIN_HISTORY_INTERVAL_MINUTES <= payload.history_interval_minutes <= MAX_HISTORY_INTERVAL_MINUTES):
+            raise HTTPException(
+                status_code=400,
+                detail=f"history_interval_minutes must be between "
+                       f"{MIN_HISTORY_INTERVAL_MINUTES} and {MAX_HISTORY_INTERVAL_MINUTES}",
+            )
+        await db.execute(
+            update(GlobalSettings)
+            .where(GlobalSettings.id == 1)
+            .values(history_interval_minutes=payload.history_interval_minutes)
+            .execution_options(synchronize_session=False)
+        )
+
+    # Routing caches only need flushing when a routing/policy field was part of
+    # the request. A request that only changes the history interval must not
+    # flush them (avoids a needless recompute burst on the live best-server API).
+    routing_touched = bool(payload.model_fields_set - {"history_interval_minutes"})
+
     await db.commit()
     await db.refresh(s)
 
     # 1. Invalidate the settings cache — next read goes to DB and re-caches
     await delete_cache(SETTINGS_CACHE_KEY)
     # 2. Invalidate routing cache — Android app picks up new policy immediately
-    await delete_cache("best_server_v2:*")
-    # 3. Invalidate policy bias cache — enforce_country/isp toggle changes must
-    #    take effect instantly; bias values were cached with the old toggle state
-    await delete_cache("policy_bias:*")
+    if routing_touched:
+        await delete_cache("best_server_v2:*")
+        # 3. Invalidate policy bias cache — enforce_country/isp toggle changes must
+        #    take effect instantly; bias values were cached with the old toggle state
+        await delete_cache("policy_bias:*")
 
     response = _to_response(s)
+    response.history_interval_minutes = await _read_history_interval(db)
     # Re-populate the settings cache with the fresh value right away
     await set_cache(SETTINGS_CACHE_KEY, response.model_dump(), ttl=SETTINGS_CACHE_TTL)
 

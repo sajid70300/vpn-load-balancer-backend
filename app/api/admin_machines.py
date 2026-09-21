@@ -22,8 +22,26 @@ from app.database import get_db
 from app.models import PhysicalMachine, VPNServer, VPNUserSession
 from app.auth import verify_api_key
 from app.audit import audit_log
+from app.cache import delete_cache
 
 router = APIRouter(prefix="/admin/machines", tags=["Admin - Physical Machines"])
+
+
+async def _clear_routing_caches():
+    """
+    Drop the short-lived routing caches so a capacity / active-state / type
+    change made here shows up in best-server and server-config responses
+    immediately (same set admin_servers clears). The change is already
+    committed by the time this runs, so a cache problem must never turn a
+    successful save into an error — it is logged and the 3s TTL covers it.
+    """
+    try:
+        await delete_cache("best_server_v2:*")
+        await delete_cache("best_server:*")
+        await delete_cache("servers_load:*")
+        await delete_cache("servers_config:*")
+    except Exception as e:
+        print(f"⚠️  Could not clear routing caches after machine change: {e}")
 
 
 # ─── Pydantic schemas ─────────────────────────────────────────────────────────
@@ -249,6 +267,16 @@ async def update_machine(
             raise HTTPException(status_code=400,
                 detail=f"IP '{payload.ip_address}' is already used by another machine.")
 
+    # The edit form always sends server_type alongside every other field, so a
+    # plain capacity edit arrives with the machine's own (unchanged) type. Only
+    # push server_type to the linked rows when the type itself is really being
+    # changed — otherwise every per-app free/premium override on those rows
+    # would be overwritten by the machine default on every save.
+    old_type = m.server_type
+    server_type_changed = (
+        payload.server_type is not None and payload.server_type != old_type
+    )
+
     for field in ("name", "ip_address", "server_type", "server_city", "server_country",
                   "flag_image_url", "max_capacity", "monitoring_api_url", "is_active"):
         val = getattr(payload, field)
@@ -265,10 +293,25 @@ async def update_machine(
         select(VPNServer).where(VPNServer.physical_machine_id == machine_id)
     )
     vpn_rows = vs_result.scalars().all()
+
+    # When the machine's default type really changes, only rows that were
+    # following the old default move with it. A row an admin set to a different
+    # type for one app (a per-app override) is left alone, and so is any row
+    # that would collide with an existing (app, type) row of this machine.
+    type_rows_changed, type_rows_kept = 0, 0
+    taken = {(r.app_name, r.server_type) for r in vpn_rows}
+
     for row in vpn_rows:
         if payload.name         is not None: row.name         = payload.name
         if payload.ip_address   is not None: row.ip_address   = payload.ip_address
-        if payload.server_type  is not None: row.server_type  = payload.server_type
+        if server_type_changed:
+            if row.server_type == old_type and (row.app_name, payload.server_type) not in taken:
+                taken.discard((row.app_name, row.server_type))
+                row.server_type = payload.server_type
+                taken.add((row.app_name, row.server_type))
+                type_rows_changed += 1
+            else:
+                type_rows_kept += 1
         if payload.server_city  is not None: row.server_city  = payload.server_city
         if payload.server_country is not None: row.server_country = payload.server_country
         if payload.flag_image_url is not None: row.flag_image_url = payload.flag_image_url
@@ -280,9 +323,17 @@ async def update_machine(
 
     await db.commit()
     await db.refresh(m)
+    await _clear_routing_caches()
+    audit_details = {"name": m.name, "ip_address": m.ip_address}
+    if payload.max_capacity is not None:
+        audit_details["max_capacity"] = payload.max_capacity
+    if server_type_changed:
+        audit_details.update({
+            "server_type_old": old_type, "server_type_new": payload.server_type,
+            "server_rows_changed": type_rows_changed, "server_rows_kept_own_type": type_rows_kept,
+        })
     await audit_log(db, token, action="machine.update", resource_type="machine",
-        resource_id=str(machine_id),
-        details={"name": m.name, "ip_address": m.ip_address})
+        resource_id=str(machine_id), details=audit_details)
 
     vs_result2 = await db.execute(
         select(VPNServer.app_name)
@@ -311,6 +362,7 @@ async def delete_machine(
     name = m.name
     await db.delete(m)
     await db.commit()
+    await _clear_routing_caches()
 
     await audit_log(db, token, action="machine.delete", resource_type="machine",
         resource_id=str(machine_id),
@@ -345,6 +397,7 @@ async def toggle_machine_active(
         row.admin_disabled = not new_state
 
     await db.commit()
+    await _clear_routing_caches()
     await audit_log(db, token, action="machine.toggle_active", resource_type="machine",
         resource_id=str(machine_id),
         details={"name": m.name, "is_active": new_state})

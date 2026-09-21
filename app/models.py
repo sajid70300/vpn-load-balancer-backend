@@ -1,5 +1,5 @@
 from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, Text, BigInteger, ForeignKey, Index
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship, deferred
 from sqlalchemy.sql import func
 from app.database import Base
 import enum
@@ -249,6 +249,16 @@ class GlobalSettings(Base):
 
     failure_rate_threshold                = Column(Float, default=10.0)
     cooldown_country_block_asn_threshold  = Column(Integer, default=3)
+
+    # How often (in minutes) the Celery snapshot task records active-user
+    # history points for the dashboard graphs (1–1440). Only the analytics
+    # snapshot task and the admin settings API use it.
+    # deferred + server_default only: the routing/decision-engine query
+    # `select(GlobalSettings)` never loads or inserts this column, so the hot
+    # path keeps working even if code is deployed before the migration runs.
+    history_interval_minutes = deferred(
+        Column(Integer, nullable=False, server_default="30")
+    )
 
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 

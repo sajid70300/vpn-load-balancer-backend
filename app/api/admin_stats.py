@@ -5,7 +5,7 @@ Admin API - Statistics & Data Export
 from fastapi import APIRouter, Depends, Query, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, and_, cast, Date
+from sqlalchemy import select, func, and_, cast, Date, extract, literal_column
 from sqlalchemy.orm import selectinload
 from typing import Optional
 from datetime import datetime, timedelta, timezone
@@ -16,6 +16,7 @@ import csv
 from app.database import get_db
 from app.models import VPNServer, VPNUserSession, SystemPeakStats, ActiveUsersHistory, ALL_APPS_KEY
 from app.auth import verify_api_key
+from app.api.admin_settings import _read_history_interval
 
 router = APIRouter(prefix="/admin", tags=["Admin - Stats & Export"])
 
@@ -97,6 +98,57 @@ async def get_summary_stats(
     }
 
 
+@router.get("/stats/capacity")
+async def get_capacity_summary(
+    db: AsyncSession = Depends(get_db),
+    _: str = Depends(verify_api_key)
+):
+    """
+    Overall VPN infrastructure capacity, for the dashboard summary cards.
+
+    Definitions (all computed live from current server configuration):
+      total_max_capacity      = sum of max_capacity over ACTIVE servers, counting
+                                each physical machine ONCE. One machine finalized
+                                for several apps (or as free + premium) has several
+                                VPNServer rows that share the machine's single
+                                capacity, so summing rows would over-count it.
+      current_sessions        = live sessions on those same active servers.
+      available_capacity      = max(0, total_max_capacity - current_sessions).
+      overall_utilization_pct = current_sessions / total_max_capacity * 100.
+      row_capacity_sum        = plain sum over active rows (what /stats/summary
+                                reports as 'capacity'); returned for comparison.
+    """
+    server_rows = (await db.execute(
+        select(VPNServer.physical_machine_id, VPNServer.ip_address, VPNServer.max_capacity)
+        .where(VPNServer.is_active == True)
+    )).all()
+
+    per_machine: dict = {}
+    row_capacity_sum = 0
+    for machine_id, ip_address, max_capacity in server_rows:
+        cap = max_capacity or 0
+        row_capacity_sum += cap
+        key = ("machine", machine_id) if machine_id is not None else ("ip", ip_address)
+        per_machine[key] = max(per_machine.get(key, 0), cap)
+
+    total_max_capacity = sum(per_machine.values())
+
+    current_sessions = (await db.execute(
+        select(func.count()).select_from(VPNUserSession)
+        .join(VPNServer, VPNUserSession.server_id == VPNServer.id)
+        .where(VPNServer.is_active == True)
+    )).scalar() or 0
+
+    return {
+        "current_sessions":        current_sessions,
+        "total_max_capacity":      total_max_capacity,
+        "available_capacity":      max(0, total_max_capacity - current_sessions),
+        "overall_utilization_pct": round(current_sessions / total_max_capacity * 100, 2) if total_max_capacity > 0 else 0.0,
+        "active_machines":         len(per_machine),
+        "row_capacity_sum":        row_capacity_sum,
+    }
+
+
 @router.get("/stats/apps")
 async def get_app_stats(
     db: AsyncSession = Depends(get_db),
@@ -155,41 +207,85 @@ async def get_peak_users(
     return {"app_name": app_name, "peak_users": row.peak_users, "peak_at": row.peak_at}
 
 
+# When a history query would return more points than this (e.g. a 30-day view
+# of 1-minute snapshots), it is aggregated into time buckets automatically so
+# the response and the browser chart stay small. At or below it, raw snapshots
+# are returned exactly as before.
+MAX_HISTORY_POINTS = 2000
+_BUCKET_MINUTES_CHOICES = [1, 5, 10, 15, 30, 60, 120, 360, 720, 1440]
+
+
 @router.get("/stats/user-history")
 async def get_user_history(
     range: str = Query("7d", pattern="^(24h|7d|30d|all)$"),
     app_name: Optional[str] = Query(None, description="Specific app name; omit for All Apps combined"),
+    bucket_minutes: Optional[int] = Query(
+        None, ge=1, le=1440,
+        description="Graph resolution: aggregate snapshots into buckets of this many minutes "
+                    "(peak value per bucket, so short spikes are kept). Omit for automatic."),
     db: AsyncSession = Depends(get_db),
     _: str = Depends(verify_api_key)
 ):
     """
-    Active-user snapshots recorded roughly every 30 minutes, for the given
-    app (or the combined "All Apps" total if app_name is omitted), for the
-    VPN Server Analytics 'History' trend chart.
+    Active-user snapshots for the given app (or the combined "All Apps" total
+    if app_name is omitted), for the VPN Server Analytics 'History' trend chart.
     range: 24h | 7d | 30d | all (default 7d).
+
+    Snapshots are recorded at the interval configured in global settings
+    (history_interval_minutes, default 30). That is independent of the graph
+    resolution: raw snapshots are returned when there are few enough, otherwise
+    (or when bucket_minutes is given) they are aggregated into buckets using the
+    MAX value per bucket so short-lived spikes are not lost.
     """
     key = app_name if app_name else ALL_APPS_KEY
-    query = (
-        select(ActiveUsersHistory)
-        .where(ActiveUsersHistory.app_name == key)
-        .order_by(ActiveUsersHistory.recorded_at.asc())
-    )
+    conditions = [ActiveUsersHistory.app_name == key]
 
     if range != "all":
         hours_map = {"24h": 24, "7d": 24 * 7, "30d": 24 * 30}
         cutoff = datetime.utcnow() - timedelta(hours=hours_map[range])
-        query = query.where(ActiveUsersHistory.recorded_at >= cutoff)
+        conditions.append(ActiveUsersHistory.recorded_at >= cutoff)
 
-    result = await db.execute(query)
-    rows = result.scalars().all()
+    if bucket_minutes is None:
+        total, first_at, last_at = (await db.execute(
+            select(func.count(), func.min(ActiveUsersHistory.recorded_at), func.max(ActiveUsersHistory.recorded_at))
+            .where(and_(*conditions))
+        )).one()
+        if total > MAX_HISTORY_POINTS and first_at and last_at:
+            wanted = (last_at - first_at).total_seconds() / 60 / (MAX_HISTORY_POINTS / 2)
+            bucket_minutes = next((b for b in _BUCKET_MINUTES_CHOICES if b >= wanted), _BUCKET_MINUTES_CHOICES[-1])
+
+    if bucket_minutes:
+        bucket_seconds = int(bucket_minutes) * 60
+        # bucket_seconds is a validated int (1..86400): inlined, not a bind
+        # parameter, so Postgres sees identical SELECT / GROUP BY expressions.
+        bucket = func.floor(extract("epoch", ActiveUsersHistory.recorded_at) / literal_column(str(bucket_seconds)))
+        rows = (await db.execute(
+            select(bucket.label("bucket"), func.max(ActiveUsersHistory.total_users).label("total_users"))
+            .where(and_(*conditions))
+            .group_by(bucket)
+            .order_by(bucket)
+        )).all()
+        points = [
+            {
+                "recorded_at": datetime.fromtimestamp(int(r.bucket) * bucket_seconds, tz=timezone.utc),
+                "total_users": r.total_users,
+            }
+            for r in rows
+        ]
+    else:
+        rows = (await db.execute(
+            select(ActiveUsersHistory)
+            .where(and_(*conditions))
+            .order_by(ActiveUsersHistory.recorded_at.asc())
+        )).scalars().all()
+        points = [{"recorded_at": r.recorded_at, "total_users": r.total_users} for r in rows]
 
     return {
         "range": range,
         "app_name": app_name,
-        "points": [
-            {"recorded_at": r.recorded_at, "total_users": r.total_users}
-            for r in rows
-        ],
+        "collection_interval_minutes": await _read_history_interval(db),
+        "bucket_minutes": bucket_minutes or None,
+        "points": points,
     }
 
 
