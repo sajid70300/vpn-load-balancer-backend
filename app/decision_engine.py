@@ -941,7 +941,28 @@ class DecisionEngine:
             ProtocolMetrics.asn          == asn          if asn          else ProtocolMetrics.asn.is_(None),
             ProtocolMetrics.network_type == network_type if network_type else ProtocolMetrics.network_type.is_(None),
         ))
-        metrics = (await self.db.execute(q)).scalar_one_or_none()
+        rows = (await self.db.execute(q)).scalars().all()
+
+        if len(rows) > 1:
+            # Duplicate rows for this exact key can exist because there is no
+            # DB-level unique constraint backing it: two concurrent requests can
+            # both see "no row yet" and both insert one (classic check-then-insert
+            # race). scalar_one_or_none() used to crash the whole request here
+            # (MultipleResultsFound -> 500) the moment this happened. Instead,
+            # converge on the oldest row (lowest id) so all callers agree on the
+            # same "canonical" row going forward, and log it for visibility.
+            # This stops the crash but does NOT merge the split counts already
+            # sitting in the other duplicate row(s), and does NOT prevent new
+            # duplicates from forming — that needs a unique constraint + an
+            # atomic upsert, tracked as separate follow-up work, not done here.
+            print(f"⚠️  Duplicate protocol_metrics rows for server_id={server_id} protocol={protocol} "
+                  f"country={country} asn={asn} network_type={network_type} — "
+                  f"{len(rows)} rows (ids={sorted(r.id for r in rows)}), using the oldest.")
+            metrics = min(rows, key=lambda r: r.id)
+        elif rows:
+            metrics = rows[0]
+        else:
+            metrics = None
 
         if not metrics:
             metrics = ProtocolMetrics(
