@@ -7,8 +7,8 @@ from app.config import settings
 async_engine = create_async_engine(
     settings.DATABASE_URL,
     pool_pre_ping=True,
-    pool_size=15,          # per worker; 4 uvicorn workers = 60 total baseline,
-                           # 100 total including overflow (below).
+    pool_size=20,          # per worker; 4 uvicorn workers = 80 total baseline,
+                           # 140 total including overflow (below).
                            # NOTE: this was previously 40 here (160+ total
                            # across 4 workers) — a 4x mismatch against the
                            # original comment's intent, since each worker
@@ -16,10 +16,27 @@ async_engine = create_async_engine(
                            # 2026-07-22 after this caused Postgres connection
                            # exhaustion (200/200, max_connections) alongside
                            # another project sharing the same instance.
-                           # Set a bit above the strict minimum (10) since
-                           # max_connections is also being raised to 300
-                           # around the same time — see alembic/ops notes.
-    max_overflow=10,       # extra burst connections under spike traffic, per worker
+                           # Raised again 2026-09-22: real production traffic
+                           # was observed needing ~106 concurrent connections
+                           # (52 active + 54 idle-in-transaction, most of the
+                           # latter brief — normal Redis-call overhead inside
+                           # get_best_server()/_load_servers(), not a leak) —
+                           # more than the previous 100-total pool could serve,
+                           # causing QueuePool TimeoutError / 500s under load.
+                           # At the same time, pg_stat_activity showed only
+                           # ~107 of the 200 max_connections in use system-wide
+                           # (the other project sharing this instance uses very
+                           # few), so there was real headroom to draw on.
+                           # 140 total leaves ~60 connections of margin under
+                           # the CONFIRMED max_connections=200 (the "raised to
+                           # 300" note above was not reflected in `SHOW
+                           # max_connections` when checked on 2026-09-22 —
+                           # verify/reconcile that separately from this fix).
+                           # This raises capacity for the current load; it does
+                           # not shorten how long each request holds a
+                           # connection — see get_best_server()'s Redis calls
+                           # in decision_engine.py for that follow-up.
+    max_overflow=15,       # extra burst connections under spike traffic, per worker
     pool_timeout=10,       # fail fast after 10s instead of hanging forever
     pool_recycle=1800,     # recycle connections every 30min to avoid stale ones
 )

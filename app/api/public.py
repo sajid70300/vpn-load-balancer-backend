@@ -570,6 +570,14 @@ async def servers_config(
             .order_by(VPNServer.ip_address)
         )
         active_servers = servers_result.scalars().all()
+        # Release the connection back to the pool now — the loop below calls
+        # get_protocol_decision_for_server() once per server, each doing its
+        # own DB read (which releases itself in turn) plus Redis-heavy
+        # scoring. Without this, one request could hold a connection open for
+        # its entire duration across every server in the app instead of just
+        # brief per-query moments — see the 2026-09-22 incident notes in
+        # database.py.
+        await db.commit()
 
         engine = DecisionEngine(db)
         decisions = []

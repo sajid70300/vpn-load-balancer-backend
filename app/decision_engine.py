@@ -115,6 +115,13 @@ class DecisionEngine:
             self.db.add(gs)
             await self.db.flush()
 
+        # Release the connection back to the pool now — this only ever runs on
+        # a cache miss (rare, given the long TTL below), and everything needed
+        # from `gs` is already read into `payload` (safe under
+        # expire_on_commit=False). Callers go on to do Redis-heavy scoring
+        # right after this returns, which doesn't need a DB connection held.
+        await self.db.commit()
+
         payload = {
             "protocol_mode":                       gs.protocol_mode,
             "disable_new_connections":              gs.disable_new_connections,
@@ -245,6 +252,11 @@ class DecisionEngine:
             "load_score":   server.load_score,
         }
 
+        # Release the connection now (see _load_servers for why). /servers_config/
+        # calls this once per server in a loop, so holding a connection through
+        # each one's Redis-heavy scoring multiplies the hold time by server count.
+        await self.db.commit()
+
         result = await self._score_protocols(
             srv, protocol_mode, user_country, user_asn, network_type
         )
@@ -321,6 +333,17 @@ class DecisionEngine:
 
         # Priority servers first
         servers.sort(key=lambda s: not s["server"].is_priority_group)
+
+        # Release this connection back to the pool now. Everything needed from
+        # these rows is already loaded into `servers` (safe under
+        # expire_on_commit=False — attributes stay accessible after commit),
+        # and the rest of get_best_server() does per-server Redis lookups
+        # (cooldown checks, protocol scoring) that don't need this connection
+        # held open. Without this, one request holds a connection for its
+        # entire duration instead of just this query's — see the 2026-09-22
+        # incident notes in database.py.
+        await self.db.commit()
+
         return servers
 
     # ------------------------------------------------------------------ #
@@ -478,6 +501,9 @@ class DecisionEngine:
                     ISPPolicy.asn     == asn,
                 ))
             )).scalars().all()
+            # Release the connection now — the branching below is pure Python
+            # over already-fetched rows (safe under expire_on_commit=False).
+            await self.db.commit()
 
             # Filter out expired policies
             active_isp = [
@@ -518,6 +544,8 @@ class DecisionEngine:
                     CountryPolicy.is_active == True,
                 ))
             )).scalar_one_or_none()
+            # Release the connection now — same reasoning as the ISP check above.
+            await self.db.commit()
 
             if cp and cp.preferred_protocol:
                 primary  = cp.preferred_protocol
@@ -637,6 +665,10 @@ class DecisionEngine:
             ).where(and_(*base, *extra_filters))
 
             row = (await self.db.execute(q)).one_or_none()
+            # Release the connection now — the fallback levels below are pure
+            # Python branching over an already-fetched row (safe under
+            # expire_on_commit=False); the caller then does Redis work.
+            await self.db.commit()
             if row is None or row.total_attempts is None or row.total_attempts == 0:
                 return None
             return {
