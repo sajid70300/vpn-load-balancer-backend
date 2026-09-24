@@ -61,19 +61,23 @@ async def make_db():
 
 @pytest.fixture(autouse=True)
 def _clear_server_list_cache():
-    """_load_servers()'s cache (decision_engine._server_list_cache) is a
-    module-level dict, deliberately shared across DecisionEngine instances
-    within one process (that's the point of the fix). But that also means it
-    persists across DIFFERENT tests in the same pytest run unless cleared —
-    without this, two unrelated tests that happen to both use app_name
-    "appA" within the same ~3 real-time seconds could see each other's
-    cached (and by then wrong) server list. Global and autouse so every
-    test file gets a clean cache, not just ones that remembered to ask for it.
+    """_load_servers()'s and get_protocol_decision_for_server()'s caches
+    (decision_engine._server_list_cache / _single_server_cache) are
+    module-level dicts, deliberately shared across DecisionEngine instances
+    within one process (that's the point of the fix). But that also means
+    they persist across DIFFERENT tests in the same pytest run unless
+    cleared — without this, two unrelated tests that happen to both use
+    app_name "appA" (or the same server IP) within the same ~10 real-time
+    seconds could see each other's cached (and by then wrong) data. Global
+    and autouse so every test file gets a clean cache, not just ones that
+    remembered to ask for it.
     """
     import app.decision_engine as de
     de._server_list_cache.clear()
+    de._single_server_cache.clear()
     yield
     de._server_list_cache.clear()
+    de._single_server_cache.clear()
 
 
 @pytest.fixture

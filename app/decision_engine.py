@@ -100,6 +100,16 @@ def invalidate_server_list_cache() -> None:
     state, or which servers exist for an app — same trigger points that
     already clear the Redis routing caches (best_server_v2:*, etc.)."""
     _server_list_cache.clear()
+    _single_server_cache.clear()
+
+
+# Same idea as _server_list_cache above, but for get_protocol_decision_for_server()'s
+# own per-server lookup (used by /servers_config/'s loop — one call per server
+# per request, previously uncached, found 2026-09-24 to be the still-remaining
+# cause of connection pool exhaustion on /servers_config/ after the other four
+# fixes). Same TTL, same in-process (not Redis) reasoning, same invalidation
+# entry point as _server_list_cache — see invalidate_server_list_cache() above.
+_single_server_cache: Dict[tuple, tuple] = {}
 
 # Protocol tie-break: when scores are equal prefer OpenVPN
 PROTOCOL_PREFERENCE_ORDER = ['openvpn', 'shadowsocks']
@@ -291,13 +301,28 @@ class DecisionEngine:
         if app_name:
             conditions.append(VPNServer.app_name == app_name)
 
-        query = (
-            select(VPNServer, func.count(VPNUserSession.id).label('session_count'))
-            .outerjoin(VPNUserSession)
-            .where(and_(*conditions))
-            .group_by(VPNServer.id)
-        )
-        rows = (await self.db.execute(query)).all()
+        cache_key = (ip_address, server_type, app_name)
+        cached = _single_server_cache.get(cache_key)
+        now = time.monotonic()
+        if cached is not None and cached[0] > now:
+            rows = cached[1]
+        else:
+            query = (
+                select(VPNServer, func.count(VPNUserSession.id).label('session_count'))
+                .outerjoin(VPNUserSession)
+                .where(and_(*conditions))
+                .group_by(VPNServer.id)
+            )
+            rows = (await self.db.execute(query)).all()
+
+            # Release the connection now (see _load_servers for why).
+            # /servers_config/ calls this once per server in a loop, so
+            # holding a connection through each one's Redis-heavy scoring
+            # multiplies the hold time by server count. Only needed on an
+            # actual DB hit — a cache hit never acquired a connection.
+            await self.db.commit()
+
+            _single_server_cache[cache_key] = (now + _SERVER_LIST_CACHE_TTL_SECONDS, rows)
 
         if not rows:
             return None
@@ -312,11 +337,6 @@ class DecisionEngine:
             "ping_ms":      server.ping_latency_ms,
             "load_score":   server.load_score,
         }
-
-        # Release the connection now (see _load_servers for why). /servers_config/
-        # calls this once per server in a loop, so holding a connection through
-        # each one's Redis-heavy scoring multiplies the hold time by server count.
-        await self.db.commit()
 
         result = await self._score_protocols(
             srv, protocol_mode, user_country, user_asn, network_type
