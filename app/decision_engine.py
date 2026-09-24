@@ -166,6 +166,16 @@ class DecisionEngine:
         # edit and the next request.
         self._policy_decision_cache = {}
 
+        # Same idea, for _get_protocol_metrics_cached(): its cache key
+        # (protocol, country, asn, network_type) doesn't depend on which
+        # server is being scored either, so it's identical across every
+        # server in one /servers_config/ call for a given protocol. Found
+        # 2026-09-25 via a live py-spy profile: even with its existing 5s
+        # Redis cache, every server's lookup was still a real network
+        # round-trip to Redis (up to ~60 per request for a 30-server app,
+        # 2 protocols each) — this avoids all but the first one per request.
+        self._metrics_cache = {}
+
     # ------------------------------------------------------------------ #
     #  Global settings (Redis-cached)                                      #
     # ------------------------------------------------------------------ #
@@ -785,6 +795,33 @@ class DecisionEngine:
     # ------------------------------------------------------------------ #
 
     async def _get_protocol_metrics_cached(
+        self,
+        app_name:     str,
+        protocol:     str,
+        country:      Optional[str],
+        asn:          Optional[str],
+        network_type: Optional[str],
+    ) -> Optional[dict]:
+        """
+        Cached wrapper around _compute_protocol_metrics_cached() — see there
+        for the Redis/DB lookup itself. Adds a per-request layer in front of
+        it: the (protocol, country, asn, network_type) key doesn't depend on
+        which server is being scored, so within one request (e.g. every
+        server in one /servers_config/ call) this avoids even the Redis
+        round-trip after the first lookup for a given protocol, not just the
+        database query the existing Redis cache already avoided.
+        """
+        cache_key = (protocol, country, asn, network_type)
+        if cache_key in self._metrics_cache:
+            return self._metrics_cache[cache_key]
+
+        result = await self._compute_protocol_metrics_cached(
+            app_name, protocol, country, asn, network_type
+        )
+        self._metrics_cache[cache_key] = result
+        return result
+
+    async def _compute_protocol_metrics_cached(
         self,
         app_name:     str,
         protocol:     str,
