@@ -93,6 +93,19 @@ class DecisionEngine:
 
     def __init__(self, db: AsyncSession):
         self.db = db
+        # Per-request cache for _get_policy_decision(): the policy result
+        # never depends on WHICH server is being scored, only on
+        # (country, asn, enforce flags) — which are identical for every
+        # server in one incoming request (e.g. every server in one
+        # /servers_config/ call, looped in public.py). Without this, that
+        # loop repeated the same ISP/Country policy database queries once
+        # per server — found 2026-09-24 as a major source of background CPU
+        # load, same root cause as the sync_server_sessions batching fix.
+        # Scoped to this instance only: a fresh DecisionEngine (and empty
+        # cache) is created per request in public.py, so this can never
+        # serve stale data across requests or across an admin's own policy
+        # edit and the next request.
+        self._policy_decision_cache = {}
 
     # ------------------------------------------------------------------ #
     #  Global settings (Redis-cached)                                      #
@@ -468,6 +481,30 @@ class DecisionEngine:
     # ------------------------------------------------------------------ #
 
     async def _get_policy_decision(
+        self,
+        country:                  str,
+        asn:                      Optional[str],
+        enforce_country_policies: bool,
+        enforce_isp_policies:     bool,
+    ) -> Optional[tuple]:
+        """
+        Cached wrapper around _compute_policy_decision() — see there for the
+        actual policy rules. Caching lives here (not inside the compute
+        function) because the compute function has several internal return
+        points; wrapping it means the cache logic never has to touch or
+        duplicate any of that branching.
+        """
+        cache_key = (country, asn, enforce_country_policies, enforce_isp_policies)
+        if cache_key in self._policy_decision_cache:
+            return self._policy_decision_cache[cache_key]
+
+        result = await self._compute_policy_decision(
+            country, asn, enforce_country_policies, enforce_isp_policies
+        )
+        self._policy_decision_cache[cache_key] = result
+        return result
+
+    async def _compute_policy_decision(
         self,
         country:                  str,
         asn:                      Optional[str],
