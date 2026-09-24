@@ -16,6 +16,25 @@ from app.models import CountryPolicy, ISPPolicy
 from conftest import make_db
 
 
+@pytest.fixture(autouse=True)
+def no_redis_cache(monkeypatch):
+    """This file tests the per-request (in-memory) cache layer specifically —
+    stub out the cross-request Redis layer added on top of it (always a
+    miss) so these tests exercise exactly what they did before that layer
+    existed. The Redis layer itself has its own dedicated tests in
+    test_policy_decision_redis_cache.py."""
+    import app.decision_engine as de
+
+    async def always_miss(k):
+        return None
+
+    async def noop_set(k, v, ttl=3):
+        pass
+
+    monkeypatch.setattr(de, "get_cache", always_miss)
+    monkeypatch.setattr(de, "set_cache", noop_set)
+
+
 def _count_statements(engine):
     counter = {"n": 0}
 

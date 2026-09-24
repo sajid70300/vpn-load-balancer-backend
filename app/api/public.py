@@ -134,7 +134,7 @@ async def best_server_v2(
             network_type=network_type,
             server_type=server_type
         )
-        await set_cache(cache_key, decision.model_dump(), ttl=3)
+        await set_cache(cache_key, decision.model_dump(), ttl=10)
         return decision
     except ValueError as e:
         raise HTTPException(status_code=503, detail=str(e))
@@ -345,7 +345,7 @@ async def best_server_legacy(
         "ovpn_base64":  selected.ovpn_base64,
     }
 
-    await set_cache(cache_key, response_data, ttl=3)
+    await set_cache(cache_key, response_data, ttl=10)
     return response_data
 
 
@@ -438,7 +438,7 @@ async def servers_load(
         )
     )
 
-    await set_cache(cache_key, response_data.model_dump(), ttl=3)
+    await set_cache(cache_key, response_data.model_dump(), ttl=10)
     return response_data
 
 
@@ -610,7 +610,7 @@ async def servers_config(
                 fallback_score    = decision.fallback_score,
             ).model_dump())
 
-        await set_cache(cache_key, decisions, ttl=3)
+        await set_cache(cache_key, decisions, ttl=10)
         return decisions
 
     else:
@@ -645,5 +645,5 @@ async def servers_config(
             for s in servers
         ]
 
-        await set_cache(cache_key, [c.model_dump() for c in configs], ttl=3)
+        await set_cache(cache_key, [c.model_dump() for c in configs], ttl=10)
         return configs

@@ -17,6 +17,7 @@ from app.schemas import (
 )
 from app.auth import verify_api_key
 from app.audit import audit_log
+from app.cache import delete_cache
 
 router = APIRouter(prefix="/admin", tags=["Admin - Metrics & Policies"])
 
@@ -394,7 +395,8 @@ async def create_country_policy(
     db.add(new_policy)
     await db.commit()
     await db.refresh(new_policy)
-    
+    await delete_cache("policy_decision:*")
+
     await audit_log(db, token, action="country_policy.create", resource_type="policy",
         resource_id=str(new_policy.id), app_name=policy.app_name,
         details={"country": policy.country, "preferred": policy.preferred_protocol, "fallback": policy.fallback_protocol})
@@ -439,7 +441,8 @@ async def update_country_policy(
         policy.notes = notes
     
     await db.commit()
-    
+    await delete_cache("policy_decision:*")
+
     await audit_log(db, token, action="country_policy.update", resource_type="policy",
         resource_id=str(policy_id), app_name=policy.app_name,
         details={"country": policy.country})
@@ -470,7 +473,8 @@ async def delete_country_policy(
     app_nm = policy.app_name
     await db.delete(policy)
     await db.commit()
-    
+    await delete_cache("policy_decision:*")
+
     await audit_log(db, token, action="country_policy.delete", resource_type="policy",
         resource_id=str(policy_id), app_name=app_nm, details={"country": country})
     
@@ -588,7 +592,8 @@ async def create_isp_policy(
     db.add(new_policy)
     await db.commit()
     await db.refresh(new_policy)
-    
+    await delete_cache("policy_decision:*")
+
     await audit_log(db, token, action="isp_policy.create", resource_type="policy",
         resource_id=str(new_policy.id), app_name=policy.app_name,
         details={"asn": policy.asn, "protocol": policy.protocol, "status": policy.status, "country": policy.country})
@@ -631,7 +636,8 @@ async def update_isp_policy(
         policy.notes = notes
     
     await db.commit()
-    
+    await delete_cache("policy_decision:*")
+
     await audit_log(db, token, action="isp_policy.update", resource_type="policy",
         resource_id=str(policy_id), app_name=policy.app_name,
         details={"asn": policy.asn, "protocol": policy.protocol})
@@ -663,7 +669,8 @@ async def delete_isp_policy(
     app_nm = policy.app_name
     await db.delete(policy)
     await db.commit()
-    
+    await delete_cache("policy_decision:*")
+
     await audit_log(db, token, action="isp_policy.delete", resource_type="policy",
         resource_id=str(policy_id), app_name=app_nm, details={"asn": asn, "protocol": protocol})
     

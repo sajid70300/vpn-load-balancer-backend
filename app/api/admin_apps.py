@@ -352,6 +352,8 @@ async def finalize_server_for_app(
     await delete_cache("best_server:*")
     await delete_cache("servers_load:*")
     await delete_cache("servers_config:*")
+    from app.decision_engine import invalidate_server_list_cache
+    invalidate_server_list_cache()
 
     action = "app.update_server" if existing else "app.finalize_server"
     await audit_log(db, token, action=action, resource_type="app",
@@ -400,6 +402,8 @@ async def remove_finalized_server(
     await delete_cache("best_server:*")
     await delete_cache("servers_load:*")
     await delete_cache("servers_config:*")
+    from app.decision_engine import invalidate_server_list_cache
+    invalidate_server_list_cache()
 
     await audit_log(db, token, action="app.remove_server", resource_type="app",
         resource_id=app_id, app_name=app_id,

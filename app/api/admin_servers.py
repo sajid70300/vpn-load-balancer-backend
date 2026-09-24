@@ -122,6 +122,8 @@ async def _clear_caches():
     await delete_cache("best_server:*")
     await delete_cache("servers_load:*")
     await delete_cache("servers_config:*")
+    from app.decision_engine import invalidate_server_list_cache
+    invalidate_server_list_cache()
 
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────

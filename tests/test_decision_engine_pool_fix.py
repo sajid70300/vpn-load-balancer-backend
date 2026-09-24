@@ -87,6 +87,23 @@ def fake_cache(monkeypatch):
             for k in keys:
                 self.kv.pop(k, None)
 
+        def pipeline(self):
+            return _FakePipeline(self.kv)
+
+    class _FakePipeline:
+        """Minimal stand-in for redis.asyncio's Pipeline, used by
+        _filter_out_cooldown_servers()'s batched cooldown check."""
+        def __init__(self, kv):
+            self.kv = kv
+            self.queued = []
+
+        def exists(self, key):
+            self.queued.append(key)
+            return self
+
+        async def execute(self):
+            return [1 if k in self.kv else 0 for k in self.queued]
+
     fake_redis = FakeRedis()
 
     async def get_redis():
@@ -207,11 +224,17 @@ def test_isp_policy_blocked_and_preferred_unchanged():
 
     async def go2():
         async with make_db() as db:
+            # Deliberately a different ASN than go() above — these two
+            # scenarios are independent, and since a real admin change to a
+            # policy goes through admin_metrics.py (which invalidates the
+            # policy-decision cache), while this test edits the DB directly,
+            # reusing the same key here would incorrectly hit go()'s cached
+            # answer instead of exercising this scenario at all.
             db.add(_server(name="s", ip_address="1.1.1.1"))
-            db.add(ISPPolicy(country="PK", asn="AS111", protocol="shadowsocks", status="preferred"))
+            db.add(ISPPolicy(country="PK", asn="AS222", protocol="shadowsocks", status="preferred"))
             await db.commit()
             engine = DecisionEngine(db)
-            decision = await engine.get_best_server(app_name="appA", user_country="PK", user_asn="AS111")
+            decision = await engine.get_best_server(app_name="appA", user_country="PK", user_asn="AS222")
             assert decision.primary_protocol == "shadowsocks"
             assert decision.fallback_protocol == "openvpn"
 

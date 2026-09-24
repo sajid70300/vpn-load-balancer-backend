@@ -39,6 +39,7 @@ Redis key scheme:
   cooldown:asn_set:<server_ip>:<country>     → Redis Set of failed ASNs
 """
 
+import time
 from typing import Optional, List, Dict
 from datetime import datetime
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -51,6 +52,54 @@ from app.cache import get_cache, set_cache, get_redis
 # ── Cache keys ────────────────────────────────────────────────────────────────
 SETTINGS_CACHE_KEY = "global_settings"
 SETTINGS_CACHE_TTL = 3600
+
+# Cross-request cache for _get_policy_decision() results (Redis — the value
+# is a plain [primary, fallback] pair, trivially JSON-safe). Country/ISP
+# policies are admin-edited and change rarely; this TTL is a safety-net
+# ceiling, not the real freshness mechanism — admin_metrics.py invalidates
+# this on every policy create/update/delete, so an admin's change is picked
+# up on the very next request regardless of TTL.
+POLICY_DECISION_CACHE_TTL = 10
+
+# Very short-lived, in-process cache for _load_servers(): shared across
+# different requests for the SAME (app_name, server_type) arriving within a
+# small window (e.g. several users of the same app a moment apart).
+# In-process (module-level dict), not Redis: these are live SQLAlchemy ORM
+# objects. Under expire_on_commit=False they stay safely readable after
+# commit/detach — but only because the code that reads them afterward (here
+# and in get_best_server/_score_protocols) only ever reads plain columns,
+# never lazy-loads a relationship. They are not safely shareable across
+# processes/Redis, so this cache is local to each worker process — with
+# multiple uvicorn workers, each one gets this benefit independently rather
+# than one shared cache across all of them, a deliberate trade-off for
+# safety (no ORM (de)serialization) over maximum effect.
+#
+# Real-time capacity sync (an explicit client requirement) matters here: a
+# server's capacity/active-state can change via the admin API at any moment,
+# and that must still be reflected promptly. So this is backed by two
+# things, not the TTL alone: (1) invalidate_server_list_cache() is called by
+# every admin endpoint that already busts the routing caches
+# (admin_servers.py, admin_machines.py, admin_apps.py) — instant on
+# whichever worker process happens to handle that admin request; (2) the TTL
+# bounds the worst case on the OTHER worker processes, which can't be
+# reached by (1) directly since this cache isn't cross-process. Matched to
+# public.py's best_server_v2/servers_config response caches (also 10s as of
+# 2026-09-24) so every layer accepts the same staleness window. For OpenVPN
+# specifically this adds little real risk on top of what already exists:
+# session counts in the database are only refreshed every 35s by the
+# monitor_vpn Celery task, so a few extra seconds of cache is a small
+# addition to an existing tolerance, not a new category of staleness.
+# Bounded in size: one entry per (app_name, server_type) combination this
+# process has actually served — a small, fixed set for this deployment.
+_SERVER_LIST_CACHE_TTL_SECONDS = 10.0
+_server_list_cache: Dict[tuple, tuple] = {}
+
+
+def invalidate_server_list_cache() -> None:
+    """Call from any admin endpoint that changes server capacity, active
+    state, or which servers exist for an app — same trigger points that
+    already clear the Redis routing caches (best_server_v2:*, etc.)."""
+    _server_list_cache.clear()
 
 # Protocol tie-break: when scores are equal prefer OpenVPN
 PROTOCOL_PREFERENCE_ORDER = ['openvpn', 'shadowsocks']
@@ -181,11 +230,10 @@ class DecisionEngine:
         if not servers:
             raise ValueError("No active servers available")
 
-        # Filter servers in cooldown (cheap Redis check)
-        available = []
-        for srv in servers:
-            if not await self._server_in_cooldown(srv["server"].ip_address, user_country, user_asn):
-                available.append(srv)
+        # Filter servers in cooldown — one batched Redis round-trip for the
+        # whole server list instead of one sequential round-trip per server
+        # (see _filter_out_cooldown_servers).
+        available = await self._filter_out_cooldown_servers(servers, user_country, user_asn)
 
         if not available:
             raise ValueError("All servers are in cooldown for your region")
@@ -301,6 +349,53 @@ class DecisionEngine:
 
         return False
 
+    async def _filter_out_cooldown_servers(
+        self,
+        servers: List[dict],
+        country: Optional[str],
+        asn:     Optional[str],
+    ) -> List[dict]:
+        """
+        Same result as calling _server_in_cooldown() once per server, but as
+        ONE batched Redis round-trip for the whole list instead of one
+        sequential round-trip per server. get_best_server() calls this once
+        per incoming request, over every candidate server for the app — with
+        many servers per app, the old one-await-per-server loop meant that
+        many sequential Redis round-trips (plus their asyncio scheduling
+        overhead) on every single request, independent of real user traffic.
+        Found 2026-09-24 alongside the DB-side fixes in tasks.py and
+        _get_policy_decision(). _server_in_cooldown() itself is untouched and
+        still used directly elsewhere (e.g. get_protocol_decision_for_server's
+        single-server path) — this is an additional, separate method for the
+        multi-server case only.
+        """
+        if not country or not servers:
+            # Matches _server_in_cooldown(): without a country, nothing is
+            # ever considered in cooldown.
+            return list(servers)
+
+        redis = await get_redis()
+        pipe = redis.pipeline()
+        for srv in servers:
+            ip = srv["server"].ip_address
+            pipe.exists(_cd_country_key(ip, country))
+            if asn:
+                pipe.exists(_cd_asn_key(ip, country, asn))
+        raw_results = await pipe.execute()
+
+        if asn:
+            # Two results per server, in the same order they were queued:
+            # [country_0, asn_0, country_1, asn_1, ...].
+            country_hits = raw_results[0::2]
+            asn_hits      = raw_results[1::2]
+            return [
+                srv for srv, c_hit, a_hit in zip(servers, country_hits, asn_hits)
+                if not (c_hit or a_hit)
+            ]
+
+        # One result per server: [country_0, country_1, ...].
+        return [srv for srv, c_hit in zip(servers, raw_results) if not c_hit]
+
     # ------------------------------------------------------------------ #
     #  Phase 1: load servers                                               #
     # ------------------------------------------------------------------ #
@@ -314,6 +409,12 @@ class DecisionEngine:
         Query active VPNServer rows for this app.
         Returns only servers not at or over max_capacity.
         """
+        cache_key = (app_name, server_type)
+        cached = _server_list_cache.get(cache_key)
+        now = time.monotonic()
+        if cached is not None and cached[0] > now:
+            return cached[1]
+
         conditions = [
             VPNServer.is_active == True,
             VPNServer.app_name  == app_name,
@@ -356,6 +457,8 @@ class DecisionEngine:
         # entire duration instead of just this query's — see the 2026-09-22
         # incident notes in database.py.
         await self.db.commit()
+
+        _server_list_cache[cache_key] = (now + _SERVER_LIST_CACHE_TTL_SECONDS, servers)
 
         return servers
 
@@ -493,14 +596,36 @@ class DecisionEngine:
         function) because the compute function has several internal return
         points; wrapping it means the cache logic never has to touch or
         duplicate any of that branching.
+
+        Two layers:
+          1. Per-request (self._policy_decision_cache, in-memory) — never
+             asks twice for the same key within one request.
+          2. Cross-request (Redis, POLICY_DECISION_CACHE_TTL) — a second
+             request a few seconds later for the same (country, asn, flags)
+             reuses the first request's answer too. Invalidated immediately
+             on any policy create/update/delete in admin_metrics.py, so the
+             TTL is a safety-net ceiling, not the real freshness guarantee.
         """
         cache_key = (country, asn, enforce_country_policies, enforce_isp_policies)
         if cache_key in self._policy_decision_cache:
             return self._policy_decision_cache[cache_key]
 
+        redis_key = f"policy_decision:{country}:{asn or '_'}:{enforce_country_policies}:{enforce_isp_policies}"
+        cached = await get_cache(redis_key)
+        if cached is not None:
+            # [] represents a cached "no policy applies" (None); a 2-item
+            # list represents an actual (primary, fallback) decision — same
+            # existence-vs-value disambiguation already used for protocol
+            # metrics caching below (get_cache returns None only when the
+            # key is genuinely absent, never for a cached empty value).
+            result = tuple(cached) if cached else None
+            self._policy_decision_cache[cache_key] = result
+            return result
+
         result = await self._compute_policy_decision(
             country, asn, enforce_country_policies, enforce_isp_policies
         )
+        await set_cache(redis_key, list(result) if result else [], ttl=POLICY_DECISION_CACHE_TTL)
         self._policy_decision_cache[cache_key] = result
         return result
 

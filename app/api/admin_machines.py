@@ -43,6 +43,9 @@ async def _clear_routing_caches():
     except Exception as e:
         print(f"⚠️  Could not clear routing caches after machine change: {e}")
 
+    from app.decision_engine import invalidate_server_list_cache
+    invalidate_server_list_cache()
+
 
 # ─── Pydantic schemas ─────────────────────────────────────────────────────────
 
