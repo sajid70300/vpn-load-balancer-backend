@@ -10,7 +10,7 @@ import socket
 import time
 import requests
 from datetime import datetime
-from sqlalchemy import select, and_, update, delete, func
+from sqlalchemy import select, and_, update, delete, func, tuple_
 from sqlalchemy.orm import Session
 from app.database import SyncSessionLocal
 from app.models import VPNServer, VPNUserSession, Notification, SystemPeakStats, ActiveUsersHistory, GlobalSettings, ALL_APPS_KEY
@@ -141,6 +141,16 @@ def sync_server_sessions(db: Session, server: VPNServer, active_users: dict):
     }
 
     new_user_sessions = []
+    # Gathered here and applied in ONE bulk_update_mappings() call below,
+    # instead of the previous one individual db.query(...).update() per
+    # continuing user. This function runs once per server row (193 rows in
+    # production) every 18 seconds — with dozens to hundreds of continuing
+    # users per row, the old per-user UPDATE pattern meant thousands of
+    # individual database round-trips every cycle, independent of real user
+    # traffic. This was found to be the main source of sustained background
+    # CPU/DB load on 2026-09-24. The end result (which rows have which byte
+    # counts) is identical; only how many queries it takes to get there changes.
+    update_mappings = []
 
     for (user_id, device_ip), user_data in active_users.items():
         config_tag     = user_data.get('config_tag')
@@ -161,25 +171,25 @@ def sync_server_sessions(db: Session, server: VPNServer, active_users: dict):
                 )
             )
         else:
-            db.query(VPNUserSession).filter(
-                VPNUserSession.server_id == server.id,
-                VPNUserSession.user_id   == user_id,
-                VPNUserSession.device_ip == device_ip
-            ).update({
+            update_mappings.append({
+                'id':             existing_sessions[(user_id, device_ip)].id,
                 'bytes_received': bytes_received,
                 'bytes_sent':     bytes_sent,
             })
 
-    # Handle disconnected users (only remove openvpn sessions)
+    if update_mappings:
+        db.bulk_update_mappings(VPNUserSession, update_mappings)
+
+    # Handle disconnected users (only remove openvpn sessions) — one batched
+    # DELETE for all of them instead of one individual DELETE per user, same
+    # reasoning as the update batching above.
     disconnected_keys = set(existing_sessions.keys()) - set(active_users.keys())
     if disconnected_keys:
-        for user_id, device_ip in disconnected_keys:
-            db.query(VPNUserSession).filter(
-                VPNUserSession.server_id == server.id,
-                VPNUserSession.user_id   == user_id,
-                VPNUserSession.device_ip == device_ip,
-                VPNUserSession.protocol  == 'openvpn',
-            ).delete()
+        db.query(VPNUserSession).filter(
+            VPNUserSession.server_id == server.id,
+            VPNUserSession.protocol  == 'openvpn',
+            tuple_(VPNUserSession.user_id, VPNUserSession.device_ip).in_(list(disconnected_keys)),
+        ).delete(synchronize_session=False)
         print(f"   ❌ {len(disconnected_keys)} OpenVPN user(s) disconnected from {server.name}")
 
     if new_user_sessions:

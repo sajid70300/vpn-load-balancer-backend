@@ -30,9 +30,13 @@ celery_app.conf.update(
 
 # Scheduled tasks
 celery_app.conf.beat_schedule = {
-    'monitor-vpn-every-18-seconds': {
+    'monitor-vpn-every-35-seconds': {
         'task': 'monitor_vpn',
-        'schedule': 18.0,
+        # Was 18s. Raised to 35s on 2026-09-24 after fixing the real CPU cost
+        # (sync_server_sessions batching, see tasks.py) — this now only trades
+        # off session/server-status freshness for a lower background check
+        # frequency, not raw query volume like before.
+        'schedule': 35.0,
     },
     'fetch-metrics-every-10-seconds': {
         'task': 'monitor_metrics',
