@@ -313,6 +313,52 @@ Manage via `/admin/settings/`:
 7. **Configure monitoring** - Health checks, error tracking, logging
 8. **Enable HTTPS** - Use reverse proxy (Nginx) with SSL/TLS
 
+## 📈 Connection Analytics (per-server statistics)
+
+Per-server request / success / failure statistics (by country and protocol) for the dashboard's
+**VPN Servers Analytics → server page** and the **Home Overview**.
+
+**Design (built so it can never slow or fail a connection request):**
+
+- The hot endpoints only do one *pipelined Redis `HINCRBY`* (`app/analytics.py`): `/v2/best_server/`
+  counts after the response is sent (background task); `/v2/connection_feedback/` counts inline with a
+  0.5 s hard cap. **No database access.** Every error is swallowed; `ANALYTICS_ENABLED=false` skips it all.
+- A Celery task (`analytics_flush`, every 60 s, `app/analytics_tasks.py`) copies the Redis counters into
+  three summary tables, idempotently (re-running a flush can never double count):
+  `server_traffic_5m`, `server_traffic_hourly`, and `server_usage_5m` (live sessions + the capacity in
+  force at that moment, so later capacity edits never rewrite history).
+- `analytics_cleanup` (hourly) applies retention (`ANALYTICS_5M_RETENTION_DAYS=3`,
+  `ANALYTICS_HOURLY_RETENTION_DAYS=60`, `ANALYTICS_USAGE_RETENTION_DAYS=30`).
+- The read API (`app/api/admin_analytics.py`: `GET /admin/analytics/servers/{id}` and
+  `GET /admin/analytics/overview`) reads only those tables and is cached in Redis for 15-60 s.
+- Nothing in the routing / decision engine reads or writes these tables.
+
+**What the numbers mean** (also shown in the UI):
+
+| Metric | Meaning |
+|---|---|
+| Requests sent | Times the backend handed this server out (`/v2/best_server/`) — a request sent to the server, *not* a confirmed connection |
+| Successful / Failed | Connection attempts the **client app reported** via `/v2/connection_feedback/` (not independently verified). One attempt = one protocol tried |
+| Success rate | successful / (successful + failed) |
+
+All timestamps are UTC. History starts on the day this was deployed (existing lifetime counters have no time dimension).
+
+**Deploying it (in this order):**
+
+1. `alembic upgrade head` — creates the 3 new tables (new empty tables only; instant, no locks on live tables).
+   (If you skip this, the API's startup `create_all` creates them, but with several workers starting at once
+   the migration is the safer route.)
+2. Restart the API.
+3. Restart **both** the Celery worker **and** Celery beat (new tasks + schedule).
+4. Deploy the frontend build *after* the backend (it calls the new endpoints).
+
+Check it: Celery logs `Task analytics_flush ... succeeded` every minute; `redis-cli -n 1 --scan --pattern 'an:*'`
+shows the counter keys; the tables fill within ~1-2 minutes of traffic.
+
+**Rollback / kill switch:** set `ANALYTICS_ENABLED=false` in `.env` and restart the API + Celery — recording
+stops immediately and the dashboards simply show no new data. Removing the feature entirely is
+`alembic downgrade a41f7c2d9e10` (drops only the 3 new tables).
+
 ## 📄 License
 
 Proprietary - VPN Load Balancer System

@@ -1,6 +1,6 @@
 from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, Text, BigInteger, ForeignKey, Index
 from sqlalchemy.orm import relationship, deferred
-from sqlalchemy.sql import func
+from sqlalchemy.sql import func, true
 from app.database import Base
 import enum
 
@@ -384,4 +384,82 @@ class ActiveUsersHistory(Base):
 
     __table_args__ = (
         Index('ix_active_users_history_app_recorded', 'app_name', 'recorded_at'),
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Connection analytics (per-server request / success / failure statistics)
+#
+#  Standalone tables — nothing here is read by the routing / decision engine,
+#  and nothing routing-related is written here. They are filled by the Celery
+#  flush task in app/analytics_tasks.py from Redis counters that the API
+#  increments (app/analytics.py), and read only by the admin analytics API.
+#
+#  Deliberately NO foreign key to vpn_status_vpnserver: statistics must keep
+#  their history when a server row is deleted or re-created, and a FK would
+#  add a lookup + cascade cost to every insert for no benefit.
+#
+#  All timestamps are UTC (timezone-aware). Counters mean:
+#    assigned = times the backend handed this server out (/v2/best_server/)
+#    success  = connection attempts the CLIENT APP reported as successful
+#    failed   = connection attempts the CLIENT APP reported as failed
+#  (one attempt = one protocol tried; a cycle where the primary protocol fails
+#  and the fallback succeeds is 1 failed + 1 success, same as protocol_metrics).
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ServerTraffic5m(Base):
+    """Counters per (5-minute bucket, server row, client country, protocol)."""
+    __tablename__ = "server_traffic_5m"
+
+    bucket_start = Column(DateTime(timezone=True), primary_key=True)
+    server_id    = Column(Integer, primary_key=True, autoincrement=False)
+    country      = Column(String(2), primary_key=True)    # ISO code, or 'XX' = unknown
+    protocol     = Column(String(12), primary_key=True)   # openvpn | shadowsocks | other
+
+    assigned = Column(Integer, nullable=False, default=0, server_default="0")
+    success  = Column(Integer, nullable=False, default=0, server_default="0")
+    failed   = Column(Integer, nullable=False, default=0, server_default="0")
+
+    __table_args__ = (
+        Index('ix_server_traffic_5m_server_bucket', 'server_id', 'bucket_start'),
+    )
+
+
+class ServerTrafficHourly(Base):
+    """Same counters rolled up per hour (rebuilt from server_traffic_5m)."""
+    __tablename__ = "server_traffic_hourly"
+
+    bucket_start = Column(DateTime(timezone=True), primary_key=True)
+    server_id    = Column(Integer, primary_key=True, autoincrement=False)
+    country      = Column(String(2), primary_key=True)
+    protocol     = Column(String(12), primary_key=True)
+
+    assigned = Column(Integer, nullable=False, default=0, server_default="0")
+    success  = Column(Integer, nullable=False, default=0, server_default="0")
+    failed   = Column(Integer, nullable=False, default=0, server_default="0")
+
+    __table_args__ = (
+        Index('ix_server_traffic_hourly_server_bucket', 'server_id', 'bucket_start'),
+    )
+
+
+class ServerUsage5m(Base):
+    """
+    Snapshot (about every 5 minutes) of each server row's live sessions and
+    the capacity that applied AT THAT MOMENT — so later capacity edits never
+    rewrite history. is_active records whether the server was enabled then.
+    """
+    __tablename__ = "server_usage_5m"
+
+    bucket_start = Column(DateTime(timezone=True), primary_key=True)
+    server_id    = Column(Integer, primary_key=True, autoincrement=False)
+
+    active_sessions      = Column(Integer, nullable=False, default=0, server_default="0")
+    openvpn_sessions     = Column(Integer, nullable=False, default=0, server_default="0")
+    shadowsocks_sessions = Column(Integer, nullable=False, default=0, server_default="0")
+    max_capacity         = Column(Integer, nullable=False, default=0, server_default="0")
+    is_active            = Column(Boolean, nullable=False, default=True, server_default=true())
+
+    __table_args__ = (
+        Index('ix_server_usage_5m_server_bucket', 'server_id', 'bucket_start'),
     )

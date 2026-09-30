@@ -32,6 +32,14 @@ class Settings(BaseSettings):
     INACTIVE_SERVER_RETRY_MINUTES: int = 10  # How long to wait before retrying an inactive server
     METRICS_API_RETRY_MINUTES: int = 5       # How long to wait before retrying a failed metrics API
 
+    # Connection analytics (per-server request/success/failure statistics —
+    # see app/analytics.py). ANALYTICS_ENABLED=false is the kill switch: no
+    # counting on the request path, and the flush/cleanup Celery tasks do nothing.
+    ANALYTICS_ENABLED: bool = True
+    ANALYTICS_5M_RETENTION_DAYS: int = 3        # fine-grained (5-minute) rows
+    ANALYTICS_HOURLY_RETENTION_DAYS: int = 60   # hourly rows (covers 30-day views)
+    ANALYTICS_USAGE_RETENTION_DAYS: int = 30    # per-server sessions/capacity snapshots
+
     # App Config
     PROJECT_NAME: str = "VPN Load Balancer API"
     VERSION: str = "1.0.0"

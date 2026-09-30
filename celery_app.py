@@ -54,6 +54,19 @@ celery_app.conf.beat_schedule = {
         'task': 'update_geoip',
         'schedule': crontab(hour=3, minute=0, day_of_week=2),  # every Tuesday at 3am UTC
     },
+    # Connection analytics (app/analytics_tasks.py). 'expires' drops a queued run
+    # that could not start in time, so a busy single-process worker never builds
+    # up a backlog of them. Both are no-ops when ANALYTICS_ENABLED=false.
+    'analytics-flush-every-60-seconds': {
+        'task': 'analytics_flush',
+        'schedule': 60.0,
+        'options': {'expires': 55},
+    },
+    'analytics-cleanup-hourly': {
+        'task': 'analytics_cleanup',
+        'schedule': 3600.0,
+        'options': {'expires': 3000},
+    },
 }
 
 # Register tasks
@@ -78,3 +91,18 @@ def track_active_users():
 @celery_app.task(name='update_geoip')
 def update_geoip():
     update_geoip_databases()
+
+# Connection analytics. Imported defensively: whatever happens in this optional
+# module, the monitoring tasks above must still register and run.
+try:
+    from app.analytics_tasks import flush_analytics, cleanup_analytics
+
+    @celery_app.task(name='analytics_flush')
+    def analytics_flush():
+        flush_analytics()
+
+    @celery_app.task(name='analytics_cleanup')
+    def analytics_cleanup():
+        cleanup_analytics()
+except Exception as _analytics_import_error:  # pragma: no cover
+    print(f"WARNING analytics tasks not registered: {_analytics_import_error!r}")

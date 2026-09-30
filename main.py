@@ -114,6 +114,7 @@ from app.api import (
     admin_users,
     admin_audit,
     admin_notifications,
+    admin_analytics,
 )
 
 
@@ -184,6 +185,7 @@ app.include_router(admin_settings.router)
 app.include_router(admin_users.router)
 app.include_router(admin_audit.router)
 app.include_router(admin_notifications.router)
+app.include_router(admin_analytics.router)
 
 # ── SPA catch-all (AFTER API routers) ────────────────────────
 if os.path.exists(FRONTEND_DIST):

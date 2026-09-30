@@ -3,7 +3,7 @@ Public API endpoints with Decision Engine Integration
 Supports both OpenVPN and Shadowsocks with intelligent protocol selection.
 """
 
-from fastapi import APIRouter, Depends, Query, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Query, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_
 from sqlalchemy.orm import selectinload
@@ -23,6 +23,7 @@ from app.schemas import (
 from app.auth import verify_api_key
 from app.cache import get_cache, set_cache, delete_cache
 from app.decision_engine import DecisionEngine
+from app import analytics
 from app.config import settings
 
 router = APIRouter()
@@ -98,6 +99,7 @@ async def root():
 
 @router.post("/v2/best_server/", response_model=BestServerDecision, tags=["Decision Engine"])
 async def best_server_v2(
+    background_tasks: BackgroundTasks,
     app_name: str = Query(..., description="Application name"),
     server_type: Optional[str] = Query(None, pattern="^(free|premium)$"),
     country: Optional[str] = Query(None, description="User's country code (e.g., US, CN)"),
@@ -123,6 +125,8 @@ async def best_server_v2(
     )
     cached = await get_cache(cache_key)
     if cached:
+        # Analytics: count the assignment after the response is sent (no added latency).
+        background_tasks.add_task(analytics.record_assignment, cached, country)
         return cached
 
     engine = DecisionEngine(db)
@@ -135,6 +139,7 @@ async def best_server_v2(
             server_type=server_type
         )
         await set_cache(cache_key, decision.model_dump(), ttl=10)
+        background_tasks.add_task(analytics.record_assignment, decision, country)
         return decision
     except ValueError as e:
         raise HTTPException(status_code=503, detail=str(e))
@@ -184,6 +189,16 @@ async def connection_feedback(
         secondary_protocol      = feedback.secondary_protocol,
         secondary_success       = feedback.secondary_success,
         secondary_connect_time_ms = feedback.secondary_connect_time_ms,
+    )
+
+    # Analytics: one Redis pipeline, never raises, hard time cap (see app/analytics.py).
+    await analytics.record_feedback(
+        feedback.server_id,
+        feedback.country,
+        [
+            (feedback.primary_protocol,   feedback.primary_success),
+            (feedback.secondary_protocol, feedback.secondary_success),
+        ],
     )
 
     # Track Shadowsocks session when shadowsocks was the successful protocol.
