@@ -359,6 +359,35 @@ shows the counter keys; the tables fill within ~1-2 minutes of traffic.
 stops immediately and the dashboards simply show no new data. Removing the feature entirely is
 `alembic downgrade a41f7c2d9e10` (drops only the 3 new tables).
 
+### Graphs (time series) and custom ranges
+
+`GET /admin/analytics/servers/{id}/series` feeds the 9 graphs on the per-server page (sessions, utilization,
+requests, successful, failed, OpenVPN vs Shadowsocks requests and success/failure, country-wise requests and
+success/failure). The report (`GET /admin/analytics/servers/{id}`) and the series accept the same
+`period` (`1h|6h|24h|7d|30d|custom`), `from`/`to` (ISO, UTC, for `custom`), `country`, `protocol`, `scope`;
+the series also takes `resolution` (seconds). **No new tables and no migration**: it reads the same
+`server_traffic_5m`, `server_traffic_hourly` and `server_usage_5m` tables.
+
+How the cost stays bounded as data grows (`app/analytics_series.py` holds the rules):
+
+- **At most 300 graph points**, whatever the range: the bucket width grows with the range (5 min ... 1 day).
+- **Top 5 countries + "Other"** per graph, so the response size does not depend on how many countries exist.
+- **Fine data only while retained**: 5-minute buckets are used only inside `ANALYTICS_5M_RETENTION_DAYS`; older
+  ranges automatically use the hourly table with >= 1 hour buckets. A custom range is clamped to
+  `ANALYTICS_HOURLY_RETENTION_DAYS` (sessions/capacity history: `ANALYTICS_USAGE_RETENTION_DAYS`).
+- **Same window as the cards**: the graph points always add up exactly to the card totals.
+- Each request is two grouped scans of the narrow `(server_id, bucket_start)` index range plus one small
+  sessions query, protected by a PostgreSQL `statement_timeout` (15 s), and cached in Redis (20-120 s).
+- "No data" (before recording began, or no snapshot) is `null`, drawn as a gap; it is never shown as zero.
+- A disabled server contributes no capacity; every snapshot keeps the capacity that applied at that time.
+
+Measured on a real PostgreSQL 16 with ~5.8 million analytics rows (30 server rows, 40 countries, 60 days hourly,
+3 days of 5-minute data), uncached: 1h-6h graphs 13-40 ms, 24h 40-170 ms, 7d 40-130 ms, 30d 150-300 ms,
+worst case (58-day custom range, all apps of a server) about 0.5 s; the report cards 6-55 ms. The cost of one
+request grows with *that server's* rows in the range (hours x countries x protocols), not with the table size.
+To keep more history, raise the retention settings knowing hourly storage is roughly
+`servers x countries x 2 x 24 x days` rows.
+
 ## 📄 License
 
 Proprietary - VPN Load Balancer System

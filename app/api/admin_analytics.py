@@ -3,6 +3,7 @@ Admin API — connection analytics.
 
   GET /admin/analytics/servers/{server_id}   per-server report (requests, successes,
                                              failures, by country, by protocol)
+  GET /admin/analytics/servers/{server_id}/series   the same server over time (graphs)
   GET /admin/analytics/overview              everything the Home Overview page shows
 
 Read-only, and NEVER reads the hot routing path: everything here comes from the
@@ -25,17 +26,23 @@ Metric definitions (also returned to the UI in "definitions"):
 Time handling: everything is UTC. Ranges of 1h/6h use 5-minute counters, ranges of
 24h/7d/30d use hourly counters, so their start is aligned to the bucket boundary
 (reported back as period.from). History starts when this feature was deployed.
+Custom from/to ranges are supported (clamped to the retained history, aligned to buckets).
+The report cards and the graphs share one window (app/analytics_series.py), so the sum of
+the graph points always equals the card totals.
 """
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import and_, case, desc, func, select
+from sqlalchemy import and_, case, desc, func, literal_column, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.analytics import BUCKET_SECONDS, KNOWN_PROTOCOLS
+from app.analytics import KNOWN_PROTOCOLS
+from app.analytics_series import OTHER, TOP_COUNTRIES, Window, build_points, iso as _iso_epoch, resolve_window
 from app.auth import verify_api_key
 from app.cache import get_cache, set_cache
+from app.config import settings
 from app.database import get_db
 from app.models import (
     ALL_APPS_KEY,
@@ -44,22 +51,19 @@ from app.models import (
     ProtocolMetrics,
     ServerTraffic5m,
     ServerTrafficHourly,
+    ServerUsage5m,
     VPNServer,
     VPNUserSession,
 )
 
 router = APIRouter(prefix="/admin/analytics", tags=["Admin - Analytics"])
 
-# period -> (seconds, which table). 1h/6h need 5-minute resolution; longer ranges
-# read the (much smaller) hourly table.
-PERIODS = {
-    "1h":  (3600,           "5m"),
-    "6h":  (6 * 3600,       "5m"),
-    "24h": (24 * 3600,      "hourly"),
-    "7d":  (7 * 86400,      "hourly"),
-    "30d": (30 * 86400,     "hourly"),
-}
+PERIOD_PATTERN = "^(1h|6h|24h|7d|30d|custom)$"
 SERVER_CACHE_TTL = 20
+# Longer ranges change slowly and cost more to compute, so they are cached longer.
+SERIES_CACHE_TTL = {"1h": 20, "6h": 20, "24h": 30, "7d": 60, "30d": 120, "custom": 120}
+QUERY_TIMEOUT_SECONDS = 15                # PostgreSQL statement_timeout for the graph queries
+_SAFE_COUNTRY = re.compile(r"^[A-Z]{2}$")
 OVERVIEW_LIVE_TTL = 15
 OVERVIEW_METRICS_TTL = 60
 OVERVIEW_TOP_SERVERS = 10
@@ -73,7 +77,8 @@ DEFINITIONS = {
     "success_rate": "success / (success + failed).",
     "failure_rate": "failed / (success + failed).",
     "attempt": "One protocol tried. If the primary protocol fails and the fallback succeeds, that is 1 failed + 1 success.",
-    "time": "All times are UTC. 1h and 6h use 5-minute buckets; 24h, 7d and 30d use hourly buckets, so the start is aligned to the bucket boundary.",
+    "time": "All times are UTC. The statistics cards read 5-minute buckets for 1h/6h and hourly buckets for longer ranges, so the start is aligned to the bucket boundary. Graphs use a bucket width that grows with the range (5 minutes up to 1 day) and never more than 300 points.",
+    "capacity": "Capacity and sessions are snapshots taken about every 5 minutes, and each snapshot keeps the capacity that applied at that moment, so changing a server's capacity never rewrites history. While a server is disabled its capacity is not counted.",
 }
 
 
@@ -134,23 +139,34 @@ def _floor(ts: float, step: int) -> int:
     return int(ts // step) * step
 
 
-# ─── per-server report ────────────────────────────────────────────────────────
+# ─── shared helpers for the per-server report and graphs ──────────────────────
 
-async def _server_report(
-    db: AsyncSession,
-    server_id: int,
-    period: str,
-    country: Optional[str],
-    protocol: Optional[str],
-    scope: str,
-) -> dict:
-    server = (await db.execute(select(VPNServer).where(VPNServer.id == server_id))).scalar_one_or_none()
-    if server is None:
-        raise HTTPException(status_code=404, detail="Server not found")
+def _dt(epoch: int) -> datetime:
+    return datetime.fromtimestamp(epoch, tz=timezone.utc)
 
+
+def _window_or_422(period: str, from_raw: Optional[str], to_raw: Optional[str],
+                   resolution: Optional[int], now: datetime) -> Window:
+    try:
+        return resolve_window(
+            period, from_raw, to_raw, resolution, int(now.timestamp()),
+            settings.ANALYTICS_5M_RETENTION_DAYS, settings.ANALYTICS_HOURLY_RETENTION_DAYS,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+async def _guard_timeout(db: AsyncSession, seconds: int = QUERY_TIMEOUT_SECONDS) -> None:
+    """Bound every statement of this request (PostgreSQL only): a runaway analytics query must
+    fail fast instead of loading the database that also serves the VPN clients."""
+    if db.get_bind().dialect.name == "postgresql":
+        await db.execute(text(f"SET LOCAL statement_timeout = '{int(seconds)}s'"))
+
+
+async def _members(db: AsyncSession, server: VPNServer, scope: str):
+    """(ids, capacity, apps) for the requested scope. 'machine' = every app row of the same
+    physical server + type (exactly how the 'Per Server' table groups rows)."""
     if scope == "machine":
-        # Every app row of the same physical server + type (this is exactly how the
-        # "Per Server" table on VPN Servers Analytics groups rows).
         members = (await db.execute(
             select(VPNServer.id, VPNServer.max_capacity, VPNServer.app_name).where(and_(
                 VPNServer.ip_address == server.ip_address,
@@ -163,12 +179,42 @@ async def _server_report(
         members = [(server.id, server.max_capacity, server.app_name)]
         capacity = _i(server.max_capacity)
         apps = [server.app_name] if server.app_name else []
-    ids = [m[0] for m in members]
+    return [m[0] for m in members], capacity, apps
+
+
+async def _first_bucket(db: AsyncSession, table, ids: List[int]) -> Optional[datetime]:
+    """
+    Earliest recorded bucket for any of these servers. One MIN() PER server id: each is an O(1)
+    lookup at the start of the (server_id, bucket_start) index. A single MIN() over an IN-list
+    would have to read every index entry of every listed server, which grows with history.
+    """
+    subs = [select(func.min(table.bucket_start)).where(table.server_id == i).scalar_subquery() for i in ids]
+    row = (await db.execute(select(*subs))).one()
+    found = [_aware(v) for v in row if v is not None]
+    return min(found) if found else None
+
+
+# ─── per-server report ────────────────────────────────────────────────────────
+
+async def _server_report(
+    db: AsyncSession,
+    server_id: int,
+    period: str,
+    country: Optional[str],
+    protocol: Optional[str],
+    scope: str,
+    window: Window,
+) -> dict:
+    server = (await db.execute(select(VPNServer).where(VPNServer.id == server_id))).scalar_one_or_none()
+    if server is None:
+        raise HTTPException(status_code=404, detail="Server not found")
+
+    ids, capacity, apps = await _members(db, server, scope)
 
     now = _utc_now()
-    seconds, granularity = PERIODS[period]
-    step = BUCKET_SECONDS if granularity == "5m" else 3600
-    from_dt = datetime.fromtimestamp(_floor(now.timestamp() - seconds, step), tz=timezone.utc)
+    granularity = window.report_source
+    from_dt = _dt(window.from_s)
+    to_dt = _dt(window.to_s) if window.to_s is not None else None
     table = ServerTraffic5m if granularity == "5m" else ServerTrafficHourly
 
     # live sessions (indexed by server_id; only currently-active sessions exist)
@@ -188,14 +234,13 @@ async def _server_report(
             table.country, table.protocol,
             func.sum(table.assigned), func.sum(table.success), func.sum(table.failed),
         )
-        .where(table.server_id.in_(ids), table.bucket_start >= from_dt)
+        .where(*([table.server_id.in_(ids), table.bucket_start >= from_dt]
+                 + ([table.bucket_start < to_dt] if to_dt is not None else [])))
         .group_by(table.country, table.protocol)
     )).all()
     rows = [(c, p, _i(a), _i(s), _i(f)) for c, p, a, s, f in grouped]
 
-    data_start = (await db.execute(
-        select(func.min(ServerTrafficHourly.bucket_start)).where(ServerTrafficHourly.server_id.in_(ids))
-    )).scalar()
+    data_start = await _first_bucket(db, ServerTrafficHourly, ids)
 
     cc = country.upper() if country else None
 
@@ -246,8 +291,9 @@ async def _server_report(
         "period": {
             "key": period,
             "from": _iso(from_dt),
-            "to": _iso(now),
+            "to": _iso(to_dt) if to_dt is not None else _iso(now),
             "granularity": "5-minute" if granularity == "5m" else "hourly",
+            "clamped": window.clamped,
         },
         "filters": {"country": cc, "protocol": protocol},
         "live": {
@@ -270,19 +316,174 @@ async def _server_report(
 @router.get("/servers/{server_id}")
 async def server_analytics(
     server_id: int,
-    period: str = Query("24h", pattern="^(1h|6h|24h|7d|30d)$"),
+    period: str = Query("24h", pattern=PERIOD_PATTERN),
     country: Optional[str] = Query(None, pattern="^[A-Za-z]{2}$", description="ISO country code filter"),
     protocol: Optional[str] = Query(None, pattern="^(openvpn|shadowsocks)$"),
     scope: str = Query("server", pattern="^(server|machine)$",
                        description="server = this app's row; machine = all app rows of the same physical server"),
     db: AsyncSession = Depends(get_db),
     _: str = Depends(verify_api_key),
+    from_: Optional[str] = Query(None, alias="from", max_length=40, description="custom range start (ISO, UTC)"),
+    to: Optional[str] = Query(None, max_length=40, description="custom range end (ISO, UTC)"),
 ):
     """Requests / successes / failures for one server, with country and protocol breakdowns."""
-    key = f"an:api:srv:{server_id}:{scope}:{period}:{(country or '-').upper()}:{protocol or '-'}"
+    window = _window_or_422(period, from_, to, None, _utc_now())
+    span = f":{window.from_s}:{window.to_s}" if period == "custom" else ""
+    key = f"an:api:srv:{server_id}:{scope}:{period}{span}:{(country or '-').upper()}:{protocol or '-'}"
     return await _cached(
         key, SERVER_CACHE_TTL,
-        lambda: _server_report(db, server_id, period, country, protocol, scope),
+        lambda: _server_report(db, server_id, period, country, protocol, scope, window),
+    )
+
+
+# ─── per-server graphs (time series) ──────────────────────────────────────────
+
+async def _series_report(
+    db: AsyncSession,
+    server_id: int,
+    country: Optional[str],
+    protocol: Optional[str],
+    scope: str,
+    window: Window,
+) -> dict:
+    await _guard_timeout(db)
+    server = (await db.execute(select(VPNServer).where(VPNServer.id == server_id))).scalar_one_or_none()
+    if server is None:
+        raise HTTPException(status_code=404, detail="Server not found")
+    ids, _capacity, apps = await _members(db, server, scope)
+
+    now = _utc_now()
+    from_dt = _dt(window.from_s)
+    to_dt = _dt(window.to_s) if window.to_s is not None else None
+    T = ServerTraffic5m if window.series_source == "5m" else ServerTrafficHourly
+    cc = country.upper() if country else None
+
+    base = [T.server_id.in_(ids), T.bucket_start >= from_dt]
+    if to_dt is not None:
+        base.append(T.bucket_start < to_dt)
+    if protocol:
+        base.append(T.protocol == protocol)
+
+    # Which countries get their own line: a country filter -> just that one; otherwise the top N
+    # by reported attempts for this range, and everything else is folded into OTHER. This keeps
+    # the response (and the work after the scan) bounded however many countries exist.
+    if cc:
+        countries = [cc]
+        group_expr = T.country
+        traffic_filter = base + [T.country == cc]
+    else:
+        top = (await db.execute(
+            select(T.country).where(*base).group_by(T.country)
+            .order_by(desc(func.sum(T.success + T.failed)), desc(func.sum(T.assigned)), T.country)
+            .limit(TOP_COUNTRIES)
+        )).scalars().all()
+        countries = [c for c in top if _SAFE_COUNTRY.fullmatch(c or "")]
+        traffic_filter = base
+        # The codes are inlined (validated A-Z above), not bound: PostgreSQL only accepts the
+        # SELECT expression in GROUP BY if it is textually identical, which bind parameters break.
+        in_list = ", ".join(f"'{c}'" for c in countries)
+        group_expr = literal_column(
+            f"CASE WHEN {T.__tablename__}.country IN ({in_list}) THEN {T.__tablename__}.country ELSE '{OTHER}' END"
+        ) if countries else None
+
+    traffic_rows = []
+    if group_expr is not None:
+        grouped = (await db.execute(
+            select(
+                T.bucket_start, group_expr.label("cg"), T.protocol,
+                func.sum(T.assigned), func.sum(T.success), func.sum(T.failed),
+            )
+            .where(*traffic_filter)
+            .group_by(T.bucket_start, group_expr, T.protocol)
+        )).all()
+        traffic_rows = [
+            (int(_aware(b).timestamp()), cg, p, _i(a), _i(s), _i(f)) for b, cg, p, a, s, f in grouped
+        ]
+    if not cc and any(r[1] == OTHER for r in traffic_rows):
+        countries = countries + [OTHER]
+
+    # Sessions + the capacity in force at each snapshot (inactive servers contribute no capacity).
+    U = ServerUsage5m
+    usage_where = [U.server_id.in_(ids), U.bucket_start >= from_dt]
+    if to_dt is not None:
+        usage_where.append(U.bucket_start < to_dt)
+    usage = (await db.execute(
+        select(
+            U.bucket_start, func.sum(U.active_sessions), func.sum(U.openvpn_sessions),
+            func.sum(U.shadowsocks_sessions),
+            func.max(case((U.is_active == True, U.max_capacity))),          # noqa: E712
+            func.sum(case((U.is_active == True, 1), else_=0)),              # noqa: E712
+        ).where(*usage_where).group_by(U.bucket_start)
+    )).all()
+    usage_rows = [
+        (int(_aware(b).timestamp()), _i(sess), _i(ov), _i(ss), (int(cap) if cap is not None else None), _i(act))
+        for b, sess, ov, ss, cap, act in usage
+    ]
+
+    traffic_start = await _first_bucket(db, ServerTrafficHourly, ids)
+    usage_start = await _first_bucket(db, ServerUsage5m, ids)
+
+    points = build_points(
+        window, traffic_rows, usage_rows, countries,
+        int(traffic_start.timestamp()) if traffic_start else None,
+    )
+    grid_end = window.from_s + window.points * window.step
+    return {
+        "scope": scope,
+        "apps": apps,
+        "server_ids": ids,
+        "window": {
+            "key": window.key,
+            "from": _iso_epoch(window.from_s),
+            "to": _iso_epoch(window.to_s if window.to_s is not None else min(grid_end, window.now_s)),
+            "step_seconds": window.step,
+            "source": "5-minute" if window.series_source == "5m" else "hourly",
+            "points": len(points),
+            "clamped": window.clamped,
+            "resolution_adjusted": window.resolution_adjusted,
+        },
+        "filters": {"country": cc, "protocol": protocol},
+        "countries": countries,
+        "points": points,
+        "data_start": _iso(traffic_start),
+        "usage_start": _iso(usage_start),
+        "retention_days": {
+            "fine": settings.ANALYTICS_5M_RETENTION_DAYS,
+            "hourly": settings.ANALYTICS_HOURLY_RETENTION_DAYS,
+            "usage": settings.ANALYTICS_USAGE_RETENTION_DAYS,
+        },
+        "definitions": {"capacity": DEFINITIONS["capacity"], "time": DEFINITIONS["time"]},
+        "generated_at": _iso(now),
+    }
+
+
+@router.get("/servers/{server_id}/series")
+async def server_series(
+    server_id: int,
+    period: str = Query("24h", pattern=PERIOD_PATTERN),
+    country: Optional[str] = Query(None, pattern="^[A-Za-z]{2}$", description="ISO country code filter"),
+    protocol: Optional[str] = Query(None, pattern="^(openvpn|shadowsocks)$"),
+    scope: str = Query("server", pattern="^(server|machine)$"),
+    resolution: Optional[int] = Query(None, ge=300, le=86400,
+                                      description="graph bucket width in seconds; omit for automatic"),
+    db: AsyncSession = Depends(get_db),
+    _: str = Depends(verify_api_key),
+    from_: Optional[str] = Query(None, alias="from", max_length=40, description="custom range start (ISO, UTC)"),
+    to: Optional[str] = Query(None, max_length=40, description="custom range end (ISO, UTC)"),
+):
+    """
+    The same statistics over time: requests / successes / failures (total, per protocol, per top
+    country), sessions, capacity and utilization. Bounded work: at most 300 points, the top 5
+    countries + OTHER, and one cached result per (server, range, filters).
+    """
+    window = _window_or_422(period, from_, to, resolution, _utc_now())
+    key = (
+        f"an:api:ser:{server_id}:{scope}:{period}:{window.from_s}:{window.to_s or 0}:{window.step}"
+        f":{(country or '-').upper()}:{protocol or '-'}"
+    )
+    return await _cached(
+        key, SERIES_CACHE_TTL[period],
+        lambda: _series_report(db, server_id, country, protocol, scope, window),
     )
 
 
