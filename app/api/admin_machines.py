@@ -23,6 +23,7 @@ from app.models import PhysicalMachine, VPNServer, VPNUserSession
 from app.auth import verify_api_key
 from app.audit import audit_log
 from app.cache import delete_cache
+from app.monitor_cooldown import clear_inactive_cooldowns
 
 router = APIRouter(prefix="/admin/machines", tags=["Admin - Physical Machines"])
 
@@ -326,6 +327,11 @@ async def update_machine(
 
     await db.commit()
     await db.refresh(m)
+    if payload.is_active:
+        # Switched ON by an admin: lift the health-check "skip" cooldown of
+        # every linked row's machine so it is re-verified on the next cycle
+        # (never raises).
+        await clear_inactive_cooldowns([(r.ip_address, r.management_port) for r in vpn_rows])
     await _clear_routing_caches()
     audit_details = {"name": m.name, "ip_address": m.ip_address}
     if payload.max_capacity is not None:
@@ -395,11 +401,16 @@ async def toggle_machine_active(
     vs_result = await db.execute(
         select(VPNServer).where(VPNServer.physical_machine_id == machine_id)
     )
-    for row in vs_result.scalars().all():
+    linked_rows = vs_result.scalars().all()
+    for row in linked_rows:
         row.is_active = new_state
         row.admin_disabled = not new_state
 
     await db.commit()
+    if new_state:
+        # Switched ON by an admin: lift the health-check "skip" cooldown so the
+        # machine is re-verified on the next cycle (never raises).
+        await clear_inactive_cooldowns([(r.ip_address, r.management_port) for r in linked_rows])
     await _clear_routing_caches()
     await audit_log(db, token, action="machine.toggle_active", resource_type="machine",
         resource_id=str(machine_id),

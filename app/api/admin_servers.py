@@ -17,6 +17,7 @@ from app.models import VPNServer, VPNUserSession
 from app.auth import verify_api_key
 from app.cache import delete_cache
 from app.audit import audit_log
+from app.monitor_cooldown import clear_inactive_cooldowns
 
 router = APIRouter(prefix="/admin/servers", tags=["Admin - Servers"])
 
@@ -298,6 +299,10 @@ async def update_server(
         server.admin_disabled = not payload.is_active
 
     await db.commit()
+    if payload.is_active:
+        # Switched ON by an admin: lift the health-check "skip" cooldown so the
+        # machine is re-verified on the next cycle (never raises).
+        await clear_inactive_cooldowns([(server.ip_address, server.management_port)])
     await _clear_caches()
     await audit_log(db, token, action="server.update", resource_type="server",
         resource_id=str(server_id), app_name=server.app_name,
@@ -355,6 +360,10 @@ async def toggle_server_active(
     server.is_active = not server.is_active
     server.admin_disabled = not server.is_active
     await db.commit()
+    if server.is_active:
+        # Switched ON by an admin: lift the health-check "skip" cooldown so the
+        # machine is re-verified on the next cycle (never raises).
+        await clear_inactive_cooldowns([(server.ip_address, server.management_port)])
     await _clear_caches()
     await audit_log(db, token, action="server.toggle_active", resource_type="server",
         resource_id=str(server_id), app_name=server.app_name,
