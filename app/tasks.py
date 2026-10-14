@@ -221,28 +221,46 @@ def process_server_group(server_ids: list, inactive_retry_seconds: int = 600):
     """
     db = get_db_session()
     try:
-        # Load all server rows in this group upfront
-        servers = db.query(VPNServer).filter(VPNServer.id.in_(server_ids)).all()
-        if not servers:
+        # Short read, only to learn which machine to contact (all rows in a
+        # group share the same ip:port). Columns only — the full rows (incl.
+        # the large ovpn_base64) are loaded after the network call below.
+        group_rows = db.query(
+            VPNServer.ip_address, VPNServer.management_port,
+            VPNServer.app_name, VPNServer.server_type,
+        ).filter(VPNServer.id.in_(server_ids)).all()
+        if not group_rows:
             return
 
-        # Use first row to get ip:port (all rows in group share the same values)
-        primary    = servers[0]
-        ip_address      = primary.ip_address
-        management_port = primary.management_port
+        ip_address      = group_rows[0].ip_address
+        management_port = group_rows[0].management_port
 
         print(f"\n{'='*60}")
-        print(f"🔍 PROCESSING: {ip_address}:{management_port} — {len(servers)} row(s)")
-        print(f"   Rows: {[s.app_name + '/' + s.server_type for s in servers]}")
+        print(f"🔍 PROCESSING: {ip_address}:{management_port} — {len(group_rows)} row(s)")
+        print(f"   Rows: {[r.app_name + '/' + r.server_type for r in group_rows]}")
         print(f"{'='*60}\n")
+
+        # Give the DB connection back BEFORE the slow network call. The call
+        # below can take 20-60+ s for an unreachable machine (retries and
+        # sleeps); holding the connection open and idle for that long is what
+        # PostgreSQL's idle_in_transaction_session_timeout (30 s on vpn3user)
+        # kills, which made the next query fail with "SSL connection has been
+        # closed unexpectedly". The session simply opens a new connection on
+        # its next use.
+        db.close()
 
         # ── Fetch management port ONCE ────────────────────────────────────
         response = get_openvpn_status(ip_address, management_port)
 
+        # Load the group's rows fresh, in a new short transaction. (This is
+        # also more accurate than before: admin edits made during the wait,
+        # e.g. admin_disabled, are now seen.)
+        servers = db.query(VPNServer).filter(VPNServer.id.in_(server_ids)).all()
+        if not servers:
+            return
+        primary = servers[0]
+
         if response is None:
-            # Set a cooldown so this group is skipped for the next 10 minutes
             cooldown_key = f"inactive_retry:{ip_address}:{management_port}"
-            redis_client.set(cooldown_key, "1", ex=inactive_retry_seconds)
             # Mark ALL rows in group as inactive and clear their sessions
             for server in servers:
                 if server.is_active:
@@ -256,6 +274,10 @@ def process_server_group(server_ids: list, inactive_retry_seconds: int = 600):
                     VPNUserSession.protocol  == 'openvpn',
                 ).delete(synchronize_session=False)
             db.commit()
+            # Set the skip-for-10-minutes cooldown only AFTER the inactive
+            # state is saved. Previously it was set first, so a failed write
+            # left a dead server marked active AND skipped for 10 minutes.
+            redis_client.set(cooldown_key, "1", ex=inactive_retry_seconds)
             print(f"❌ {ip_address}:{management_port} is DOWN — {len(servers)} row(s) marked inactive.")
             return
 
@@ -429,8 +451,14 @@ def fetch_server_metrics(server_id: int):
             return
 
         monitoring_api_url = server.monitoring_api_url
+        server_name        = server.name
         cooldown_key  = f"metrics_retry:{monitoring_api_url}"
         retry_seconds = settings.METRICS_API_RETRY_MINUTES * 60
+
+        # Give the DB connection back before the HTTP call (see
+        # process_server_group): it must never sit idle in a transaction
+        # while we wait on the network. The session reopens on next use.
+        db.close()
 
         try:
             response = requests.get(f"{monitoring_api_url}/metrics", timeout=5)
@@ -481,12 +509,12 @@ def fetch_server_metrics(server_id: int):
             else:
                 # Non-200 response — set cooldown
                 redis_client.set(cooldown_key, "1", ex=retry_seconds)
-                print(f"⚠️ Failed to fetch metrics for {server.name}: HTTP {response.status_code} — cooldown set for {settings.METRICS_API_RETRY_MINUTES}m")
+                print(f"⚠️ Failed to fetch metrics for {server_name}: HTTP {response.status_code} — cooldown set for {settings.METRICS_API_RETRY_MINUTES}m")
 
         except requests.exceptions.RequestException as e:
             # Timeout or connection error — set cooldown
             redis_client.set(cooldown_key, "1", ex=retry_seconds)
-            print(f"❌ Error fetching metrics for {server.name}: {e} — cooldown set for {settings.METRICS_API_RETRY_MINUTES}m")
+            print(f"❌ Error fetching metrics for {server_name}: {e} — cooldown set for {settings.METRICS_API_RETRY_MINUTES}m")
 
     finally:
         db.close()
@@ -517,6 +545,11 @@ def monitor_vpn_status():
         return
 
     try:
+        # Read the server list, then release the DB connection straight away.
+        # The loop below is slow (network calls to every machine, minutes in
+        # total) and process_server_group() opens its own short sessions, so
+        # this session must NOT stay open across it — an idle open transaction
+        # is killed by PostgreSQL's idle_in_transaction_session_timeout.
         db = get_db_session()
         try:
             vpn_servers = db.query(VPNServer).all()
@@ -530,20 +563,19 @@ def monitor_vpn_status():
             for server in vpn_servers:
                 key = f"{server.ip_address}:{server.management_port}"
                 groups[key].append(server.id)
-
-            INACTIVE_RETRY_SECONDS = settings.INACTIVE_SERVER_RETRY_MINUTES * 60
-
-            for key, server_ids in groups.items():
-                cooldown_key = f"inactive_retry:{key}"
-                if redis_client.exists(cooldown_key):
-                    ttl = redis_client.ttl(cooldown_key)
-                    print(f"⏳ Skipping {key} — inactive cooldown active ({ttl}s remaining)")
-                    continue
-                print(f"🔄 Processing {key} — {len(server_ids)} row(s)")
-                process_server_group(server_ids, inactive_retry_seconds=INACTIVE_RETRY_SECONDS)
-
         finally:
             db.close()
+
+        INACTIVE_RETRY_SECONDS = settings.INACTIVE_SERVER_RETRY_MINUTES * 60
+
+        for key, server_ids in groups.items():
+            cooldown_key = f"inactive_retry:{key}"
+            if redis_client.exists(cooldown_key):
+                ttl = redis_client.ttl(cooldown_key)
+                print(f"⏳ Skipping {key} — inactive cooldown active ({ttl}s remaining)")
+                continue
+            print(f"🔄 Processing {key} — {len(server_ids)} row(s)")
+            process_server_group(server_ids, inactive_retry_seconds=INACTIVE_RETRY_SECONDS)
     finally:
         redis_client.delete(lock_id)
 
@@ -568,6 +600,11 @@ def monitor_all_server_metrics():
         return
 
     try:
+        # Read (id, url) pairs, then release the DB connection straight away:
+        # the loop below makes one HTTP call per machine (a minute or more in
+        # total) and fetch_server_metrics() opens its own short sessions. Left
+        # open and idle, this connection was killed by PostgreSQL's
+        # idle_in_transaction_session_timeout and db.close() raised at the end.
         db = get_db_session()
         try:
             servers = db.query(VPNServer).filter(
@@ -575,26 +612,26 @@ def monitor_all_server_metrics():
                 VPNServer.monitoring_api_url.isnot(None),
                 VPNServer.monitoring_api_url != ''
             ).all()
-
-            # Deduplicate by monitoring_api_url so each physical machine is fetched once
-            seen_urls: set = set()
-            skipped_urls: set = set()
-            for server in servers:
-                url = server.monitoring_api_url
-                if url in seen_urls or url in skipped_urls:
-                    continue
-                cooldown_key = f"metrics_retry:{url}"
-                if redis_client.exists(cooldown_key):
-                    ttl = redis_client.ttl(cooldown_key)
-                    print(f"⏳ Skipping metrics for {url} — cooldown active ({ttl}s remaining)")
-                    skipped_urls.add(url)
-                    continue
-                seen_urls.add(url)
-                fetch_server_metrics(server.id)
-
-            print(f"📊 Fetched metrics for {len(seen_urls)} unique monitoring API(s), skipped {len(skipped_urls)}")
+            targets = [(s.id, s.monitoring_api_url) for s in servers]
         finally:
             db.close()
+
+        # Deduplicate by monitoring_api_url so each physical machine is fetched once
+        seen_urls: set = set()
+        skipped_urls: set = set()
+        for server_id, url in targets:
+            if url in seen_urls or url in skipped_urls:
+                continue
+            cooldown_key = f"metrics_retry:{url}"
+            if redis_client.exists(cooldown_key):
+                ttl = redis_client.ttl(cooldown_key)
+                print(f"⏳ Skipping metrics for {url} — cooldown active ({ttl}s remaining)")
+                skipped_urls.add(url)
+                continue
+            seen_urls.add(url)
+            fetch_server_metrics(server_id)
+
+        print(f"📊 Fetched metrics for {len(seen_urls)} unique monitoring API(s), skipped {len(skipped_urls)}")
     finally:
         redis_client.delete(lock_id)
 
