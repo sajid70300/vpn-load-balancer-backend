@@ -494,7 +494,12 @@ def fetch_server_metrics(server_id: int):
                     ).count()
                     row.load_score = calculate_load_score(row, session_count)
 
-                    if row.max_capacity > 0 and session_count >= row.max_capacity:
+                    # With machine-level capacity on, the "machine_capacity_check"
+                    # task (app/machine_capacity.py) raises the capacity alert for the
+                    # machine as a whole, so this per-app one is skipped (it would
+                    # only duplicate it). Kill switch off -> exactly as before.
+                    if (not settings.MACHINE_CAPACITY_ENABLED
+                            and row.max_capacity > 0 and session_count >= row.max_capacity):
                         create_notification_if_needed(
                             db, 'capacity_reached', row,
                             f"Server '{row.name}' ({row.ip_address}) has reached its maximum "

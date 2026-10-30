@@ -39,15 +39,20 @@ Redis key scheme:
   cooldown:asn_set:<server_ip>:<country>     → Redis Set of failed ASNs
 """
 
+import logging
 import time
 from typing import Optional, List, Dict
 from datetime import datetime
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_
 
+from app.config import settings
+from app.machine_capacity import load_machine_loads
 from app.models import VPNServer, VPNUserSession, ProtocolMetrics, CountryPolicy, ISPPolicy, GlobalSettings
 from app.schemas import BestServerDecision, ProtocolConfig
 from app.cache import get_cache, set_cache, get_redis
+
+logger = logging.getLogger(__name__)
 
 # ── Cache keys ────────────────────────────────────────────────────────────────
 SETTINGS_CACHE_KEY = "global_settings"
@@ -245,41 +250,65 @@ class DecisionEngine:
         protocol_mode = gs.protocol_mode
 
         # ── Phase 1: load servers ─────────────────────────────────────────
-        servers = await self._load_servers(app_name, server_type)
+        # `servers` = rows with room left; `overflow` = rows that are full ONLY
+        # because their physical machine (all apps together) is at capacity
+        # (always empty when MACHINE_CAPACITY_ENABLED is off). Overflow is a last
+        # resort, tried only when the normal list cannot serve this request, so
+        # a request that the old per-app rule could serve is never failed by
+        # the machine-level rule.
+        servers, overflow = await self._load_server_tiers(app_name, server_type)
 
-        if not servers:
+        tiers = [servers]
+        if overflow and settings.CAPACITY_OVERFLOW_FALLBACK:
+            tiers.append(overflow)
+
+        if not any(tiers):
             raise ValueError("No active servers available")
 
-        # Filter servers in cooldown — one batched Redis round-trip for the
-        # whole server list instead of one sequential round-trip per server
-        # (see _filter_out_cooldown_servers).
-        available = await self._filter_out_cooldown_servers(servers, user_country, user_asn)
+        last_error: Optional[ValueError] = None
+        for tier in tiers:
+            if not tier:
+                continue
 
-        if not available:
-            raise ValueError("All servers are in cooldown for your region")
+            # Filter servers in cooldown — one batched Redis round-trip for the
+            # whole server list instead of one sequential round-trip per server
+            # (see _filter_out_cooldown_servers).
+            available = await self._filter_out_cooldown_servers(tier, user_country, user_asn)
 
-        # Score and sort servers
-        scored: List[dict] = []
-        for srv in available:
-            score = self._server_load_score(srv)
-            scored.append({**srv, "load_score_computed": score})
+            if not available:
+                last_error = ValueError("All servers are in cooldown for your region")
+                continue
 
-        scored.sort(key=lambda s: (
-            not s["server"].is_priority_group,  # priority servers always first
-            -s["load_score_computed"],           # within each tier, best load score first
-            s["server"].load_score,
-            s["server"].id,
-        ))
+            # Score and sort servers
+            scored: List[dict] = []
+            for srv in available:
+                score = self._server_load_score(srv)
+                scored.append({**srv, "load_score_computed": score})
 
-        # ── Phase 2: score protocols on best available server ─────────────
-        for srv in scored:
-            result = await self._score_protocols(
-                srv, protocol_mode, user_country, user_asn, network_type
-            )
-            if result:
-                return await self._build_decision_response(result)
+            # In the overflow tier every machine is at/over 100%, so the session
+            # part of the score is clamped to 0 for all of them and could no
+            # longer tell them apart: rank by how far over capacity each machine
+            # is instead (constant 0 for the normal tier => its order is unchanged).
+            is_overflow = tier is not servers
+            scored.sort(key=lambda s: (
+                not s["server"].is_priority_group,  # priority servers always first
+                (s["machine_sessions"] / s["machine_capacity"]) if is_overflow else 0,
+                -s["load_score_computed"],           # within each tier, best load score first
+                s["server"].load_score,
+                s["server"].id,
+            ))
 
-        raise ValueError("All servers at capacity")
+            # ── Phase 2: score protocols on best available server ─────────
+            for srv in scored:
+                result = await self._score_protocols(
+                    srv, protocol_mode, user_country, user_asn, network_type
+                )
+                if result:
+                    return await self._build_decision_response(result)
+
+            last_error = ValueError("All servers at capacity")
+
+        raise last_error
 
     async def get_protocol_decision_for_server(
         self,
@@ -437,13 +466,32 @@ class DecisionEngine:
     ) -> List[dict]:
         """
         Query active VPNServer rows for this app.
-        Returns only servers not at or over max_capacity.
+        Returns only servers not at or over capacity (per-app row, and — unless
+        MACHINE_CAPACITY_ENABLED is off — the whole machine across all apps).
+        """
+        servers, _overflow = await self._load_server_tiers(app_name, server_type)
+        return servers
+
+    async def _load_server_tiers(
+        self,
+        app_name:    str,
+        server_type: Optional[str],
+    ) -> tuple:
+        """
+        Same query as always, returning (servers, overflow):
+          servers  — rows with room left (the list _load_servers() returns).
+          overflow — rows that are NOT full for their own app but whose physical
+                     machine, counting every app, is at/over its capacity.
+                     Always [] when MACHINE_CAPACITY_ENABLED is off or the
+                     machine totals could not be read.
+        A row full under its own app's count is excluded from both, exactly as
+        before. Both lists are cached together for the same short TTL.
         """
         cache_key = (app_name, server_type)
         cached = _server_list_cache.get(cache_key)
         now = time.monotonic()
         if cached is not None and cached[0] > now:
-            return cached[1]
+            return cached[1], (cached[2] if len(cached) > 2 else [])
 
         conditions = [
             VPNServer.is_active == True,
@@ -461,11 +509,28 @@ class DecisionEngine:
         result = await self.db.execute(query)
         all_rows = result.all()
 
+        # Total users per physical machine (all apps together). One extra
+        # grouped query, only on a cache miss. Any failure here must never
+        # break routing: fall back to the per-app behaviour for this refresh.
+        # (No rollback on failure: it would expire the rows loaded above. The
+        # commit() below ends/releases the transaction either way.)
+        machine_loads: Dict[int, tuple] = {}
+        if settings.MACHINE_CAPACITY_ENABLED:
+            machine_ids = {s.physical_machine_id for s, _ in all_rows if s.physical_machine_id is not None}
+            if machine_ids:
+                try:
+                    machine_loads = await load_machine_loads(self.db, machine_ids)
+                except Exception as e:
+                    # logging (never raises, ASCII only) — this runs on the request path.
+                    logger.warning("machine capacity lookup failed, using per-app capacity this cycle: %r", e)
+                    machine_loads = {}
+
         servers = []
+        overflow = []
         for server, session_count in all_rows:
             if server.max_capacity > 0 and session_count >= server.max_capacity:
                 continue
-            servers.append({
+            entry = {
                 "server":       server,
                 "sessions":     session_count,
                 "max_capacity": server.max_capacity,
@@ -473,10 +538,22 @@ class DecisionEngine:
                 "ram_usage":    server.ram_usage,
                 "ping_ms":      server.ping_latency_ms,
                 "load_score":   server.load_score,
-            })
+            }
+            load = machine_loads.get(server.physical_machine_id)
+            if load and load[0] > 0:
+                machine_capacity, machine_sessions = load
+                # Extra keys used only for the decision. The response keeps
+                # reporting this row's own sessions / max_capacity (unchanged).
+                entry["machine_sessions"] = machine_sessions
+                entry["machine_capacity"] = machine_capacity
+                if machine_sessions >= machine_capacity:
+                    overflow.append(entry)
+                    continue
+            servers.append(entry)
 
         # Priority servers first
         servers.sort(key=lambda s: not s["server"].is_priority_group)
+        overflow.sort(key=lambda s: not s["server"].is_priority_group)
 
         # Release this connection back to the pool now. Everything needed from
         # these rows is already loaded into `servers` (safe under
@@ -488,9 +565,9 @@ class DecisionEngine:
         # incident notes in database.py.
         await self.db.commit()
 
-        _server_list_cache[cache_key] = (now + _SERVER_LIST_CACHE_TTL_SECONDS, servers)
+        _server_list_cache[cache_key] = (now + _SERVER_LIST_CACHE_TTL_SECONDS, servers, overflow)
 
-        return servers
+        return servers, overflow
 
     # ------------------------------------------------------------------ #
     #  Phase 1: server load score                                          #
@@ -502,8 +579,12 @@ class DecisionEngine:
         cpu_score = max(0.0, 100.0 - srv["cpu_usage"])
         ram_score = max(0.0, 100.0 - srv["ram_usage"])
 
-        if srv["max_capacity"] > 0:
-            load_pct = (srv["sessions"] / srv["max_capacity"]) * 100.0
+        # Judge the machine by ALL its users (every app) against its own
+        # capacity when that is known; otherwise this row's own sessions.
+        sessions = srv.get("machine_sessions", srv["sessions"])
+        capacity = srv.get("machine_capacity", srv["max_capacity"])
+        if capacity > 0:
+            load_pct = (sessions / capacity) * 100.0
         else:
             load_pct = srv["cpu_usage"]
         session_score = max(0.0, 100.0 - load_pct)

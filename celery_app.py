@@ -67,6 +67,13 @@ celery_app.conf.beat_schedule = {
         'schedule': 3600.0,
         'options': {'expires': 3000},
     },
+    # Machine-level "capacity reached" alert (app/machine_capacity.py): one
+    # small grouped query. Does nothing when MACHINE_CAPACITY_ENABLED=false.
+    'machine-capacity-check-every-60-seconds': {
+        'task': 'machine_capacity_check',
+        'schedule': 60.0,
+        'options': {'expires': 55},
+    },
 }
 
 # Register tasks
@@ -91,6 +98,17 @@ def track_active_users():
 @celery_app.task(name='update_geoip')
 def update_geoip():
     update_geoip_databases()
+
+# Machine-level capacity alert. Imported defensively, like analytics below: the
+# monitoring tasks above must still register and run whatever happens here.
+try:
+    from app.machine_capacity import run_machine_capacity_check
+
+    @celery_app.task(name='machine_capacity_check')
+    def machine_capacity_check():
+        run_machine_capacity_check()
+except Exception as _machine_capacity_import_error:  # pragma: no cover
+    print(f"WARNING machine_capacity_check not registered: {_machine_capacity_import_error!r}")
 
 # Connection analytics. Imported defensively: whatever happens in this optional
 # module, the monitoring tasks above must still register and run.

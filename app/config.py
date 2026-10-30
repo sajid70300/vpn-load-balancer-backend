@@ -40,6 +40,19 @@ class Settings(BaseSettings):
     ANALYTICS_HOURLY_RETENTION_DAYS: int = 60   # hourly rows (covers 30-day views)
     ANALYTICS_USAGE_RETENTION_DAYS: int = 30    # per-server sessions/capacity snapshots
 
+    # Machine-level capacity (see app/machine_capacity.py). A machine shared by
+    # several apps is judged by its TOTAL users across all apps against its own
+    # max_capacity, both when choosing a server and for the "capacity reached"
+    # alert. MACHINE_CAPACITY_ENABLED=false is the kill switch: routing and alerts
+    # return to the previous per-app behaviour exactly.
+    MACHINE_CAPACITY_ENABLED: bool = True
+    # When every candidate is "full" only because of the machine-level rule (it
+    # would NOT have been full under the old per-app rule), still serve the
+    # least-loaded one instead of failing the request.
+    CAPACITY_OVERFLOW_FALLBACK: bool = True
+    # A machine that stays full raises at most one alert per this many minutes.
+    CAPACITY_ALERT_REPEAT_MINUTES: int = 30
+
     # App Config
     PROJECT_NAME: str = "VPN Load Balancer API"
     VERSION: str = "1.0.0"

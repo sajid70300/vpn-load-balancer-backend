@@ -388,6 +388,34 @@ request grows with *that server's* rows in the range (hours x countries x protoc
 To keep more history, raise the retention settings knowing hourly storage is roughly
 `servers x countries x 2 x 24 x days` rows.
 
+## 🏭 Machine-level capacity (shared machines)
+
+A physical machine can be finalized for several apps; each (machine, app) pair is its own `VPNServer`
+row. Capacity used to be checked **per app row** (that app's users vs the machine's full capacity), so a
+machine in 5 apps could carry ~5x its capacity before any app saw it as full, and no alert fired. Now the
+machine is judged by its **total users across all apps** (both protocols; `app/machine_capacity.py`)
+against `PhysicalMachine.max_capacity`:
+
+- **Routing** (`/v2/best_server/`, `decision_engine._load_server_tiers`): a machine whose total reaches its
+  capacity is not offered; the load score uses the machine total too. If every candidate is full *only*
+  because of this rule, the least-over-capacity one is still served (`CAPACITY_OVERFLOW_FALLBACK`), so this
+  rule can never fail a request the old per-app rule would have served. A row that is full under its own
+  app's count is excluded exactly as before. The response still reports the row's own `current_users` /
+  `max_capacity`. Cost: one extra grouped query only when the 10 s server-list cache refreshes.
+- **Alert**: Celery task `machine_capacity_check` (every 60 s) creates one `capacity_reached` notification
+  per active machine whose total >= capacity, at most one per `CAPACITY_ALERT_REPEAT_MINUTES` (30) per machine
+  and never while an unread one exists. It has no app name (the Home Overview shows it under "all apps",
+  not under a single-app filter). It replaces the old per-app alert in `fetch_server_metrics`.
+- **Not changed**: legacy `/best_server/`, `/servers_load/`, `/servers_config/` still use per-row numbers.
+
+Settings (all optional, defaults shown): `MACHINE_CAPACITY_ENABLED=true`, `CAPACITY_OVERFLOW_FALLBACK=true`,
+`CAPACITY_ALERT_REPEAT_MINUTES=30`.
+
+**Deploy** (no migration, no frontend change): copy `app/machine_capacity.py`, `app/config.py`,
+`app/decision_engine.py`, `app/tasks.py`, `celery_app.py` → restart `vpn3-celery` and `vpn3-beat`, then
+`vpn3-api`. **Rollback / kill switch:** set `MACHINE_CAPACITY_ENABLED=false` in `.env` and restart the API +
+Celery + beat: routing and alerts return to the previous per-app behaviour exactly (the task becomes a no-op).
+
 ## 📄 License
 
 Proprietary - VPN Load Balancer System
